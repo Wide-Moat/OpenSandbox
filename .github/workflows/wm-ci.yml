@@ -1,10 +1,19 @@
 # What this fork does with its own changes: test them, prove they still exist, and build
 # the images this installation runs.
 #
-# Upstream's own 25 workflows are disabled at the repository level rather than renamed --
-# several of them publish, to PyPI, Docker Hub and GitHub Pages, and one of them on
-# another fork here cut a release and moved the base tag onto a fork commit. A rename
-# only takes effect on refs that carry it, and a tag does not.
+# Upstream's own 25 workflows are disabled through the API rather than renamed -- several
+# of them publish, to PyPI, Docker Hub and GitHub Pages, and one of them on another fork
+# here cut a release and moved the base tag onto a fork commit. A rename only takes
+# effect on refs that carry it, and a tag does not.
+#
+# The images are built here with the standard actions rather than through the
+# organisation's shared image-build workflow. That workflow lives in a PRIVATE
+# repository, and GitHub will not resolve a private reusable workflow from a public
+# caller whatever `actions/permissions/access` says -- measured: "workflow was not
+# found". This repository is public because a fork of a public repository cannot be
+# anything else. The shared workflow exists to carry a daemonless buildah build onto
+# runners with no Docker; these are GitHub-hosted runners, which have one, so nothing is
+# being duplicated here -- the two solve different problems.
 name: wm-ci
 
 on:
@@ -14,13 +23,10 @@ on:
   push:
     branches: [wm]
 
-# packages: write is needed by the image job, and a reusable workflow cannot raise the
-# caller's token above what the caller was granted. Measured against the repository here
-# that already publishes this way: it declares both at workflow level, and its packages
-# exist. The read-only jobs below do not use the token for anything else.
+# Read-only by default. The image job raises its own to packages: write, so the test
+# jobs run with a token that cannot publish anything.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: wm-ci-${{ github.head_ref || github.ref_name }}
@@ -104,6 +110,10 @@ jobs:
 
   images:
     needs: [changes-are-accounted-for, egress, controller, server]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -123,12 +133,46 @@ jobs:
           - name: ingress-gateway
             context: .
             dockerfile: components/ingress/Dockerfile
-    uses: Wide-Moat/ci/.github/workflows/image-build.yml@main
-    with:
-      runner: ${{ vars.CI_BUILD_RUNNER || 'ubuntu-latest' }}
-      context: ${{ matrix.context }}
-      dockerfile: ${{ matrix.dockerfile }}
-      image: ghcr.io/wide-moat/opensandbox-${{ matrix.name }}
-      # Pushed only from the branch the images are built from. A pull request builds and
-      # discards, which still proves the Dockerfile works.
-      push: ${{ github.ref == 'refs/heads/wm' && github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.ref == 'refs/heads/wm' && github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/wide-moat/opensandbox-${{ matrix.name }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          # Pushed only from the branch the images are built from. A pull request builds
+          # and discards, which still proves the Dockerfile works.
+          push: ${{ github.ref == 'refs/heads/wm' && github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.sha }}
+            GIT_COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      # The digest is what an installation pins. A tag is a convenience that can be
+      # moved; the digest is the record of what was actually built.
+      - name: the digest to pin
+        if: steps.build.outputs.digest != ''
+        run: |
+          echo "ghcr.io/wide-moat/opensandbox-${{ matrix.name }}@${{ steps.build.outputs.digest }}" \
+            >> "$GITHUB_STEP_SUMMARY"
