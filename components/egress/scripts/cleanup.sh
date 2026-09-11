@@ -88,12 +88,26 @@ kill_stray_mitmdump() {
   # `-u mitmproxy` scopes pkill to that uid so we never touch anything else;
   # `-f mitmdump` is the cmdline match safety net inside that uid.
   # SIGTERM first; give it a moment; SIGKILL anything that ignored TERM.
-  try pkill -TERM -u mitmproxy -f mitmdump
-  # Short sleep, but bounded so this hook still finishes inside the
-  # supervisor's PreStartTimeout (default 30s) with plenty of headroom.
-  sleep 1
-  try pkill -KILL -u mitmproxy -f mitmdump
-  log "stray mitmdump processes reaped (best-effort)"
+  #
+  # pkill exits 1 when it matched nothing, which is the common case: a clean stop has
+  # already reaped mitmdump, and there is no stray left to signal. Waiting a second for
+  # a process that was never signalled costs that second on EVERY sandbox stop.
+  #
+  # Not through `try`, which pipes into sed and so reports the exit status of sed
+  # rather than of pkill -- the status is the whole point here. And no PIPESTATUS
+  # either: this is /bin/sh, and the image's shell is ash, where that array does not
+  # exist. It expands to nothing, the test reads as "matched nothing", and the sleep
+  # would be skipped even when there WAS a stray to kill. Measured before it was
+  # written this way.
+  if pkill -TERM -u mitmproxy -f mitmdump >/dev/null 2>&1; then
+    # Something was signalled. Short sleep, bounded so this hook still finishes inside
+    # the supervisor's PreStartTimeout (default 30s) with plenty of headroom.
+    sleep 1
+    try pkill -KILL -u mitmproxy -f mitmdump
+    log "stray mitmdump processes reaped (best-effort)"
+    return 0
+  fi
+  log "no stray mitmdump processes to reap"
 }
 
 main() {
