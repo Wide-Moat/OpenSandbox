@@ -72,8 +72,12 @@ jobs:
           cache-dependency-path: kubernetes/go.sum
       - working-directory: kubernetes
         run: go vet ./...
+      # `make test`, not a bare `go test`: the controller suite runs against envtest, and
+      # that target is what downloads the kube-apiserver and etcd binaries it needs.
+      # Without them the suite fails in BeforeSuite -- on unmodified upstream too, so it
+      # is a missing dependency rather than anything this fork changed.
       - working-directory: kubernetes
-        run: go test ./cmd/... ./internal/...
+        run: make test
 
   server:
     runs-on: ubuntu-latest
