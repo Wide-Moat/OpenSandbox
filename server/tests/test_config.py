@@ -134,6 +134,99 @@ def test_load_config_env_api_key_without_toml_key(tmp_path, monkeypatch):
     assert loaded.server.api_key == "env-only-key"
 
 
+def test_wm4_load_config_env_override_tenants_auth_token(tmp_path, monkeypatch):
+    """OPENSANDBOX_TENANTS_AUTH_TOKEN should override tenants.auth_token from TOML.
+
+    The shared secret between this server and an HTTP tenant provider can otherwise
+    only be given inline in TOML. That forces the whole configuration file to be a
+    Kubernetes Secret rather than a ConfigMap, which in turn makes the chart's
+    checksum/config annotation watch the wrong object, so a configuration change does
+    not roll the pod. An environment override removes that chain.
+    """
+    _reset_config(monkeypatch)
+    monkeypatch.setenv("OPENSANDBOX_TENANTS_AUTH_TOKEN", "env-shared-secret")
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+
+        [tenants]
+        provider = "http"
+        endpoint = "http://tenant-provider:8080/tenant"
+        auth_header = "X-Tenant-Token"
+        auth_token = "toml-shared-secret"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.tenants.auth_token == "env-shared-secret"
+
+
+def test_wm4_load_config_env_tenants_auth_token_without_toml_key(tmp_path, monkeypatch):
+    """The override should work when TOML omits auth_token entirely.
+
+    This is the case that matters in practice: the secret never appears in the file.
+    """
+    _reset_config(monkeypatch)
+    monkeypatch.setenv("OPENSANDBOX_TENANTS_AUTH_TOKEN", "env-only-secret")
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+
+        [tenants]
+        provider = "http"
+        endpoint = "http://tenant-provider:8080/tenant"
+        auth_header = "X-Tenant-Token"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.tenants.auth_token == "env-only-secret"
+
+
+def test_wm4_load_config_without_env_uses_toml_tenants_auth_token(tmp_path, monkeypatch):
+    """With the variable unset the TOML value stands: the override adds, never replaces."""
+    _reset_config(monkeypatch)
+    monkeypatch.delenv("OPENSANDBOX_TENANTS_AUTH_TOKEN", raising=False)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+
+        [tenants]
+        provider = "http"
+        endpoint = "http://tenant-provider:8080/tenant"
+        auth_header = "X-Tenant-Token"
+        auth_token = "toml-shared-secret"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.tenants.auth_token == "toml-shared-secret"
+
+
 def test_load_config_without_env_uses_toml_api_key(tmp_path, monkeypatch):
     """When OPENSANDBOX_SERVER_API_KEY is unset, TOML api_key should be used."""
     _reset_config(monkeypatch)

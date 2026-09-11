@@ -108,7 +108,15 @@ auth_token = "bearer-token-here"
 | `max_stale_seconds` | `300.0` | Max seconds to serve stale cache when endpoint is unreachable. |
 | `timeout_seconds` | `5.0` | HTTP request timeout. |
 | `auth_header` | — | Optional header name for provider-level auth. |
-| `auth_token` | — | Optional token value for that header. |
+| `auth_token` | — | Optional token value for that header. Prefer the environment variable below. |
+
+`auth_token` can also be supplied as **`OPENSANDBOX_TENANTS_AUTH_TOKEN`**, which
+overrides the TOML field when set, in the same way `OPENSANDBOX_SERVER_API_KEY`
+overrides `server.api_key`. Prefer it: a secret written into the configuration file
+forces the whole file to be handled as a secret. On Kubernetes that means mounting the
+config from a `Secret` rather than a `ConfigMap`, which makes the chart's
+`checksum/config` annotation watch an object that no longer holds the config — so a
+configuration change stops rolling the pod.
 
 **HTTP endpoint contract:**
 
