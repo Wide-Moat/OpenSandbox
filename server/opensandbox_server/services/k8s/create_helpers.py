@@ -129,6 +129,7 @@ def _build_create_workload_context(
             resource_requests=egress_config.requests,
             resource_limits=egress_config.limits,
             otlp_endpoint=egress_config.otlp_endpoint,
+            enforcement=egress_config.enforcement,
         )
 
     return _CreateWorkloadContext(

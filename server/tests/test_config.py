@@ -134,6 +134,94 @@ def test_load_config_env_api_key_without_toml_key(tmp_path, monkeypatch):
     assert loaded.server.api_key == "env-only-key"
 
 
+def test_wm2_egress_enforcement_defaults_to_sidecar(tmp_path, monkeypatch):
+    """An unset key must mean today's behaviour, or upgrading changes a running cluster."""
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        mode = "dns"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    # getattr with the default spelled out: on a tree without the field the answer is
+    # the same "sidecar", which is correct -- that IS the behaviour when unset. This
+    # test is the guard on the default, and it is meant to pass on both trees.
+    assert getattr(loaded.egress, "enforcement", "sidecar") == "sidecar"
+
+
+def test_wm2_load_config_accepts_enforcement_external(tmp_path, monkeypatch):
+    """[egress] enforcement = "external" must be accepted and carried through."""
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        mode = "dns"
+        enforcement = "external"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    # No getattr default here: an unmodified tree parses the key, ignores it, and this
+    # must fail -- an accepted-but-ignored setting is the failure mode being fixed.
+    assert getattr(loaded.egress, "enforcement", "sidecar") == "external", (
+        "[egress] enforcement was accepted but not applied"
+    )
+
+
+def test_wm2_load_config_rejects_an_unknown_enforcement(tmp_path, monkeypatch):
+    """A typo must be refused, not read as the default.
+
+    Falling back would put a deployment configured for a sandboxed kernel back on the
+    path that cannot work there, and the only symptom would be a crash-loop whose
+    message is about netlink -- naming neither the key nor the misspelling.
+    """
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        enforcement = "externl"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    with pytest.raises(ValidationError):
+        config_module.load_config(config_path)
+
+
 def test_wm4_load_config_env_override_tenants_auth_token(tmp_path, monkeypatch):
     """OPENSANDBOX_TENANTS_AUTH_TOKEN should override tenants.auth_token from TOML.
 

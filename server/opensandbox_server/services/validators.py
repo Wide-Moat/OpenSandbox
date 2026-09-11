@@ -28,6 +28,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from fastapi import HTTPException, status
 
+from opensandbox_server.config import (
+    EGRESS_ENFORCEMENT_EXTERNAL,
+    EGRESS_ENFORCEMENT_SIDECAR,
+)
 from opensandbox_server.services.constants import RESERVED_LABEL_PREFIX, SandboxErrorCodes
 
 if TYPE_CHECKING:
@@ -612,6 +616,20 @@ def ensure_credential_proxy_configured(
     if not credential_proxy or not credential_proxy.enabled:
         return
 
+    # The dns+nft requirement is about enforcement INSIDE the pod: without nftables the
+    # sidecar cannot stop a client from reaching a credential's destination by another
+    # route, so substituting the credential would be a false promise. When enforcement
+    # is external that guarantee is made outside the pod, and requiring a subsystem a
+    # sandboxed kernel does not have would refuse the configuration for a reason that
+    # does not apply to it.
+    enforcement = (
+        egress_config.enforcement
+        if egress_config is not None and getattr(egress_config, "enforcement", None)
+        else EGRESS_ENFORCEMENT_SIDECAR
+    )
+    if enforcement == EGRESS_ENFORCEMENT_EXTERNAL:
+        return
+
     egress_mode = egress_config.mode if egress_config else None
     if egress_mode != "dns+nft":
         raise HTTPException(
@@ -643,14 +661,27 @@ def ensure_egress_runtime_compatible(
     network_policy: Optional["NetworkPolicy"],
     secure_runtime: Optional["SecureRuntimeConfig"] = None,
     effective_runtime_class: Optional[str] = None,
+    egress_config: Optional["EgressConfig"] = None,
 ) -> None:
     """
     Reject network_policy when the secure runtime lacks iptables nat table support.
 
     gVisor's netstack does not implement the iptables nat table, which the egress
     sidecar requires for DNS redirect (REDIRECT target on port 53).
+
+    Not applicable when ``[egress] enforcement`` is ``external``: the sidecar then
+    installs no redirect, so the nat table it would have needed is not needed at all.
+    That combination -- gVisor plus a CNI-level policy -- is what the network isolation
+    guide already recommends for this case.
     """
     if not network_policy:
+        return
+    enforcement = (
+        egress_config.enforcement
+        if egress_config is not None and getattr(egress_config, "enforcement", None)
+        else EGRESS_ENFORCEMENT_SIDECAR
+    )
+    if enforcement == EGRESS_ENFORCEMENT_EXTERNAL:
         return
     runtime_type = None
     if secure_runtime is not None and secure_runtime.type:

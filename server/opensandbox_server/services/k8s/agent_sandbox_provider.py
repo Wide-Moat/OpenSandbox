@@ -101,6 +101,7 @@ class AgentSandboxProvider(WorkloadProvider):
             agent_config.template_file if agent_config else None
         )
         self.ingress_config = app_config.ingress if app_config else None
+        self.egress_config = app_config.egress if app_config else None
         self.execd_init_resources = k8s_config.execd_init_resources if k8s_config else None
         self.execd_run_as_init = bool(app_config and app_config.runtime.execd_run_as_init)
 
@@ -206,6 +207,7 @@ class AgentSandboxProvider(WorkloadProvider):
         ensure_egress_runtime_compatible(
             egress_settings.network_policy if egress_settings is not None else None,
             effective_runtime_class=merged_pod_spec.get("runtimeClassName"),
+            egress_config=self.egress_config,
         )
         if platform is not None:
             WorkloadProvider.ensure_platform_compatible_with_affinity(merged_pod_spec, platform)

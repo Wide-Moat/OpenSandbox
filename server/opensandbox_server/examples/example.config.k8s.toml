@@ -96,6 +96,17 @@ mode = "direct"
 [egress]
 image = "opensandbox/egress:v1.1.7"
 mode = "dns"
+# Where egress is enforced. Default "sidecar": the sidecar installs the DNS and HTTP
+# redirects in the sandbox netns and is given CAP_NET_ADMIN to do it.
+#
+# Set "external" when something OUTSIDE the pod already constrains the traffic -- a
+# CNI-level FQDN policy, a resolver the sandbox is pointed at. The sidecar then installs
+# no netfilter rules and is given no capabilities, which is what makes it start under a
+# sandboxed kernel such as gVisor. In exchange the deployment must point the sandbox's
+# resolver and HTTPS_PROXY at the sidecar itself, because nothing redirects into it any
+# more; setting this without doing that leaves the sandbox unfiltered.
+# See docs/components/egress.md#enforcement-outside-the-pod.
+# enforcement = "external"
 # Default is true (recommended for dual-stack CNI). Set false only if you need IPv6 in the netns (see server/configuration.md).
 # disable_ipv6 = false
 # Optional Kubernetes resources for the generated egress sidecar. Tune for your workload.

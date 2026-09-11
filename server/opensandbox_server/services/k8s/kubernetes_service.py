@@ -419,7 +419,11 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         ensure_credential_proxy_configured(
             request.credential_proxy, request.network_policy, self.app_config.egress
         )
-        ensure_egress_runtime_compatible(request.network_policy, self.app_config.secure_runtime)
+        ensure_egress_runtime_compatible(
+            request.network_policy,
+            self.app_config.secure_runtime,
+            egress_config=self.app_config.egress,
+        )
 
     def _ensure_pool_mode_compatible(
         self,

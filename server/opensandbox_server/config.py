@@ -78,6 +78,10 @@ GATEWAY_ROUTE_MODE_URI = "uri"
 EGRESS_MODE_DNS = "dns"
 EGRESS_MODE_DNS_NFT = "dns+nft"
 
+# Where egress is enforced, which is a different question from what it filters.
+EGRESS_ENFORCEMENT_SIDECAR = "sidecar"
+EGRESS_ENFORCEMENT_EXTERNAL = "external"
+
 
 def _is_valid_kubernetes_container_resource_name(name: str) -> bool:
     if name in _KUBERNETES_STANDARD_CONTAINER_RESOURCES:
@@ -847,6 +851,21 @@ class EgressConfig(BaseModel):
     ] = Field(
         default=EGRESS_MODE_DNS,
         description="Egress enforcement passed to the sidecar as OPENSANDBOX_EGRESS_MODE (dns or dns+nft).",
+    )
+    enforcement: Literal[
+        EGRESS_ENFORCEMENT_SIDECAR,
+        EGRESS_ENFORCEMENT_EXTERNAL,
+    ] = Field(
+        default=EGRESS_ENFORCEMENT_SIDECAR,
+        description=(
+            "Where egress is enforced. 'sidecar' (default) is unchanged behaviour: the "
+            "sidecar installs the DNS and HTTP redirects in the sandbox network namespace "
+            "and is given CAP_NET_ADMIN to do it. 'external' says something outside the "
+            "pod already constrains the traffic -- a CNI-level policy, a resolver the "
+            "sandbox is pointed at -- so the sidecar installs no netfilter rules and is "
+            "given no capabilities. Required under a sandboxed kernel such as gVisor, "
+            "where netfilter does not exist and CAP_NET_ADMIN cannot be granted."
+        ),
     )
     disable_ipv6: bool = Field(
         default=DEFAULT_EGRESS_DISABLE_IPV6,

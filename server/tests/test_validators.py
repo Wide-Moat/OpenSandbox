@@ -649,6 +649,38 @@ class TestCredentialProxyConfiguration:
             EgressConfig(image="egress:latest", mode="dns+nft"),
         )
 
+    def test_wm2_allows_dns_only_when_enforcement_is_external(self):
+        """dns+nft is a requirement of IN-POD enforcement, not of the credential proxy.
+
+        Without nftables the sidecar cannot stop a client from reaching a credential's
+        destination by another route, so substituting the credential would be a false
+        promise. Enforced externally, that guarantee is made outside the pod — and
+        nftables does not exist as a subsystem under a sandboxed kernel, so requiring it
+        refuses the configuration for a reason that does not apply to it.
+        """
+        from opensandbox_server.api.schema import CredentialProxyConfig, NetworkPolicy
+        from opensandbox_server.config import EgressConfig
+
+        ensure_credential_proxy_configured(
+            CredentialProxyConfig(enabled=True),
+            NetworkPolicy(default_action="deny", egress=[]),
+            EgressConfig(**{"image": "egress:latest", "mode": "dns", "enforcement": "external"}),
+        )
+
+    def test_wm2_still_requires_nft_under_sidecar_enforcement(self):
+        """The guard: unchanged for every deployment that does not opt in."""
+        from opensandbox_server.api.schema import CredentialProxyConfig, NetworkPolicy
+        from opensandbox_server.config import EgressConfig
+
+        with pytest.raises(HTTPException) as exc_info:
+            ensure_credential_proxy_configured(
+                CredentialProxyConfig(enabled=True),
+                NetworkPolicy(default_action="deny", egress=[]),
+                EgressConfig(**{"image": "egress:latest", "mode": "dns", "enforcement": "sidecar"}),
+            )
+        assert exc_info.value.status_code == 400
+        assert "dns+nft" in exc_info.value.detail["message"]
+
     def test_warns_for_default_allow_policy(self, monkeypatch):
         from opensandbox_server.api.schema import CredentialProxyConfig, NetworkPolicy
         from opensandbox_server.config import EgressConfig
@@ -691,6 +723,31 @@ class TestCredentialProxyConfiguration:
         )
 
 
+def _ensure_runtime_compatible_with_egress(network_policy, secure_runtime, egress_fields):
+    """Call the runtime check the way the server does, passing the egress config when the
+    check accepts one.
+
+    Written with inspect rather than by naming the keyword, because the keyword is part of
+    the change under test: a test that named it unconditionally would fail to CALL on an
+    unmodified tree, which proves only that a parameter is missing and would go green the
+    moment one existed with nothing behind it. Here the unmodified tree takes the old
+    signature, runs, and fails on the ANSWER.
+    """
+    import inspect
+
+    from opensandbox_server.config import EgressConfig
+
+    kwargs = {}
+    if egress_fields is not None and "egress_config" in inspect.signature(
+        ensure_egress_runtime_compatible
+    ).parameters:
+        kwargs["egress_config"] = EgressConfig(
+            **{k: v for k, v in egress_fields.items()
+               if k in EgressConfig.model_fields}
+        )
+    return ensure_egress_runtime_compatible(network_policy, secure_runtime, **kwargs)
+
+
 class TestEgressRuntimeCompatibility:
 
     def _network_policy(self):
@@ -711,6 +768,46 @@ class TestEgressRuntimeCompatibility:
         assert exc_info.value.status_code == 400
         assert "gVisor" in exc_info.value.detail["message"]
         assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
+
+    def test_wm2_allows_gvisor_when_enforcement_is_external(self):
+        """gVisor plus a CNI-level policy is what the network isolation guide recommends.
+
+        The sidecar installs no redirect in that mode, so the iptables nat table this
+        check is about is not needed. The check refuses the combination the docs
+        suggest, which is the contradiction this resolves.
+
+        The config is built from a TOML-shaped dict with the key written out, so the
+        test compiles against a tree where the field does not exist and fails on the
+        DECISION rather than on a missing attribute.
+        """
+        _ensure_runtime_compatible_with_egress(
+            self._network_policy(),
+            self._secure_runtime("gvisor"),
+            {"image": "egress:test", "mode": "dns", "enforcement": "external"},
+        )
+
+    def test_wm2_still_rejects_gvisor_with_sidecar_enforcement(self):
+        """The guard: the default is unchanged.
+
+        Without this, deleting the runtime check outright would pass the test above
+        while removing a real protection for every existing deployment.
+        """
+        with pytest.raises(HTTPException) as exc_info:
+            _ensure_runtime_compatible_with_egress(
+                self._network_policy(),
+                self._secure_runtime("gvisor"),
+                {"image": "egress:test", "mode": "dns+nft", "enforcement": "sidecar"},
+            )
+        assert exc_info.value.status_code == 400
+
+    def test_wm2_rejects_gvisor_when_no_egress_config_is_given(self):
+        """An absent config must read as the default, not as permission."""
+        with pytest.raises(HTTPException):
+            _ensure_runtime_compatible_with_egress(
+                self._network_policy(),
+                self._secure_runtime("gvisor"),
+                None,
+            )
 
     def test_allows_kata_with_network_policy(self):
         ensure_egress_runtime_compatible(self._network_policy(), self._secure_runtime("kata"))

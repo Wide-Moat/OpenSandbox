@@ -106,6 +106,7 @@ class BatchSandboxProvider(WorkloadProvider):
     ):
         self.k8s_client = k8s_client
         self.ingress_config = app_config.ingress if app_config else None
+        self.egress_config = app_config.egress if app_config else None
 
         k8s_config = app_config.kubernetes if app_config else None
         template_file_path = k8s_config.batchsandbox_template_file if k8s_config else None
@@ -309,6 +310,7 @@ class BatchSandboxProvider(WorkloadProvider):
         ensure_egress_runtime_compatible(
             egress_settings.network_policy if egress_settings is not None else None,
             effective_runtime_class=merged_pod_spec.get("runtimeClassName"),
+            egress_config=self.egress_config,
         )
         if platform is not None and not windows_profile:
             WorkloadProvider.ensure_platform_compatible_with_affinity(merged_pod_spec, platform)
