@@ -1,0 +1,134 @@
+# What this fork does with its own changes: test them, prove they still exist, and build
+# the images this installation runs.
+#
+# Upstream's own 25 workflows are disabled at the repository level rather than renamed --
+# several of them publish, to PyPI, Docker Hub and GitHub Pages, and one of them on
+# another fork here cut a release and moved the base tag onto a fork commit. A rename
+# only takes effect on refs that carry it, and a tag does not.
+name: wm-ci
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [wm]
+  push:
+    branches: [wm]
+
+# packages: write is needed by the image job, and a reusable workflow cannot raise the
+# caller's token above what the caller was granted. Measured against the repository here
+# that already publishes this way: it declares both at workflow level, and its packages
+# exist. The read-only jobs below do not use the token for anything else.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: wm-ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # The three sets that describe this fork's changes must agree. A rebase that silently
+  # dropped one is the failure; see hack/wm-check.sh.
+  changes-are-accounted-for:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The check walks upstream-base..HEAD, so it needs the history and the tag.
+          fetch-depth: 0
+      - run: hack/wm-check.sh
+
+  egress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+          cache-dependency-path: components/egress/go.sum
+      - name: gofmt
+        working-directory: components/egress
+        run: |
+          files="$(gofmt -l . ../internal)"
+          [ -z "$files" ] || { echo "$files"; exit 1; }
+      - working-directory: components/egress
+        run: go vet ./...
+      - working-directory: components/egress
+        run: go test ./...
+
+  controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+          cache-dependency-path: kubernetes/go.sum
+      - working-directory: kubernetes
+        run: go vet ./...
+      - working-directory: kubernetes
+        run: go test ./cmd/... ./internal/...
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install uv
+      - working-directory: server
+        run: uv sync
+      - working-directory: server
+        run: uv run ruff check .
+      - working-directory: server
+        run: uv run pytest tests/ -q
+
+  # Every WM test must FAIL against the unmodified tree. One that passes there is either
+  # a change upstream has absorbed -- in which case the commit should be dropped -- or a
+  # test that asserts nothing. Both are worth a red build.
+  tests-fail-without-the-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install uv
+      - run: hack/wm-fail-on-base.sh
+
+  images:
+    needs: [changes-are-accounted-for, egress, controller, server]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            context: server
+            dockerfile: server/Dockerfile
+          - name: egress
+            context: .
+            dockerfile: components/egress/Dockerfile
+          - name: execd
+            context: .
+            dockerfile: components/execd/Dockerfile
+          - name: controller
+            context: kubernetes
+            dockerfile: kubernetes/Dockerfile
+          - name: ingress-gateway
+            context: .
+            dockerfile: components/ingress/Dockerfile
+    uses: Wide-Moat/ci/.github/workflows/image-build.yml@main
+    with:
+      runner: ${{ vars.CI_BUILD_RUNNER || 'ubuntu-latest' }}
+      context: ${{ matrix.context }}
+      dockerfile: ${{ matrix.dockerfile }}
+      image: ghcr.io/wide-moat/opensandbox-${{ matrix.name }}
+      # Pushed only from the branch the images are built from. A pull request builds and
+      # discards, which still proves the Dockerfile works.
+      push: ${{ github.ref == 'refs/heads/wm' && github.event_name != 'pull_request' }}
