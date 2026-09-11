@@ -15,6 +15,7 @@
 package constants
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -79,6 +80,24 @@ const (
 	EnvNameserverExempt          = "OPENSANDBOX_EGRESS_NAMESERVER_EXEMPT"
 	EnvCredentialVaultRequireTLS = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_REQUIRE_TLS"
 
+	// EnvEnforcement selects WHERE egress is enforced.
+	//
+	// EnforcementSidecar (the default, and the behaviour when unset) is the
+	// arrangement everything else in this component assumes: the sidecar owns the
+	// sandbox network namespace, installs the DNS and HTTP redirects itself, and
+	// filters what passes through them.
+	//
+	// EnforcementExternal says the pod is not where enforcement happens. Something
+	// outside it — a CNI policy on the host side of the veth, a resolver the pod is
+	// pointed at, an admission policy — already constrains the traffic, and the
+	// sidecar must not try to install netfilter rules of its own. That is not a
+	// preference: under a sandboxed kernel such as gVisor, nftables and iptables do
+	// not exist as subsystems and CAP_NET_ADMIN cannot be granted, so the redirect
+	// setup fails at startup and the component crash-loops. The credential proxy
+	// still works in this mode, because clients reach mitmproxy as an explicit proxy
+	// rather than by being redirected into it.
+	EnvEnforcement = "OPENSANDBOX_EGRESS_ENFORCEMENT"
+
 	// MITM: mitmdump transparent; Linux + CAP_NET_ADMIN, runs as a dedicated user.
 	// Static mitm options (mode, connection_strategy, listen_host, stream_large_bodies,
 	// ignore_hosts, ssl_verify_upstream_trusted_confdir default) live in
@@ -126,6 +145,39 @@ func EnvIntOrDefault(key string, defaultVal int) int {
 		return defaultVal
 	}
 	return v
+}
+
+// EnforcementExternal and EnforcementSidecar are the values of EnvEnforcement.
+const (
+	EnforcementSidecar  = "sidecar"
+	EnforcementExternal = "external"
+)
+
+// ParseEnforcement reads EnvEnforcement. Empty means the default, EnforcementSidecar.
+//
+// An unrecognised value is an error rather than a fallback to the default. A
+// misspelt "externl" that silently meant "sidecar" would put the component back on
+// the path that cannot work in the environment the operator was configuring for,
+// and the only symptom would be a crash-loop whose message is about netlink.
+func ParseEnforcement(raw string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "":
+		return EnforcementSidecar, nil
+	case EnforcementSidecar, EnforcementExternal:
+		return v, nil
+	default:
+		return "", fmt.Errorf("unknown %s value %q: want %q or %q",
+			EnvEnforcement, raw, EnforcementSidecar, EnforcementExternal)
+	}
+}
+
+// EnforcementIsExternal answers the question every call site actually asks.
+// It treats an unparsable value as NOT external, so a bad value cannot silently
+// disable the enforcement this component installs; ParseEnforcement, called once at
+// startup, is what refuses it outright.
+func EnforcementIsExternal() bool {
+	v, err := ParseEnforcement(os.Getenv(EnvEnforcement))
+	return err == nil && v == EnforcementExternal
 }
 
 func IsTruthy(v string) bool {

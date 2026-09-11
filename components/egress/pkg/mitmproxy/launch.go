@@ -62,6 +62,14 @@ type Config struct {
 	ScriptPaths []string
 	// OnExit is called (if non-nil) when mitmdump exits. Called from a background goroutine.
 	OnExit func(error)
+	// Regular runs mitmdump as an ordinary forward proxy instead of the transparent
+	// mode baked into config.yaml. Clients then reach it through HTTPS_PROXY and the
+	// real destination arrives in CONNECT, rather than being recovered from
+	// SO_ORIGINAL_DST after a redirect. Set when egress enforcement lives outside the
+	// pod, where no redirect exists to be transparent about.
+	//
+	// Applied with --set, which takes precedence over the config file.
+	Regular bool
 }
 
 // Running: child mitmdump; use GracefulShutdown to SIGTERM+reap before process exit.
@@ -143,10 +151,23 @@ func Launch(cfg Config) (*Running, error) {
 	return &Running{Cmd: cmd, done: done}, nil
 }
 
+// ConfigFromEnv fills in the parts of Config that are decided by the environment
+// rather than by the caller, and returns the result.
+//
+// One place makes the decision, so the launcher and anything that has to reason about
+// what mitmdump will be told cannot disagree about it.
+func ConfigFromEnv(cfg Config) Config {
+	cfg.Regular = constants.EnforcementIsExternal()
+	return cfg
+}
+
 func buildMitmdumpArgs(cfg Config) []string {
 	args := []string{
 		"--listen-port", strconv.Itoa(cfg.ListenPort),
 		"--set", "flow_detail=0",
+	}
+	if cfg.Regular {
+		args = append(args, "--set", "mode=regular")
 	}
 	if strings.TrimSpace(cfg.ListenHost) != "" {
 		args = append(args, "--listen-host", cfg.ListenHost)

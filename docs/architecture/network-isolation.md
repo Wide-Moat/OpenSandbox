@@ -181,6 +181,12 @@ Both Approach 1 (`deny.always` via egress sidecar) and Approach 2 (per-sandbox `
 If you need both gVisor's syscall isolation and FQDN egress control:
 - Use `kata-qemu` instead — it provides comparable security isolation and supports the egress sidecar.
 - Alternatively, use a CNI-level FQDN policy (e.g., Cilium `toFQDNs`) for network isolation alongside gVisor.
+- To keep the sidecar's DNS filtering and Credential Vault while a CNI policy does the
+  address-level enforcement, run it with `OPENSANDBOX_EGRESS_ENFORCEMENT=external`. The
+  sidecar then installs no netfilter rules and needs no `CAP_NET_ADMIN`, so it starts
+  under gVisor; in exchange the deployment must point the sandbox's resolver and
+  `HTTPS_PROXY` at it, because nothing redirects traffic into it any more. See
+  [Enforcement outside the pod](../components/egress.md#enforcement-outside-the-pod).
 
 The same architectural constraint applies to transparent service meshes such as Istio/Envoy sidecar injection: OpenSandbox egress expects to own outbound interception inside the pod network namespace. If a mesh sidecar also rewrites outbound traffic in that namespace, egress-sidecar features such as per-sandbox network policy, transparent MITM, and Credential Vault are not currently supported together. Prefer excluding sandbox pods from mesh injection or enforcing outbound policy at the platform network layer instead.
 

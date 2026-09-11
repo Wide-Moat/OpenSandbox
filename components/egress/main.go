@@ -118,14 +118,24 @@ func main() {
 		log.Infof("denied hostname webhook enabled")
 	}
 
-	exemptDst := dnsproxy.ParseNameserverExemptList()
-	if len(exemptDst) > 0 {
-		log.Infof("nameserver exempt list: %v (proxy upstream in this list will not set SO_MARK)", exemptDst)
+	// With enforcement outside the pod there is nothing to install and nothing to
+	// bypass: the sandbox is pointed at this proxy by its own resolver configuration
+	// rather than by a redirect, so the exempt list and the SO_MARK it controls are
+	// both moot. Attempting the setup here is not merely useless — it is fatal, since
+	// netfilter is unavailable to an unprivileged process in a sandboxed kernel.
+	var exemptDst []netip.Addr
+	if constants.EnforcementIsExternal() {
+		log.Infof("enforcement=external: not installing the DNS redirect; traffic is expected to arrive by resolver configuration")
+	} else {
+		exemptDst = dnsproxy.ParseNameserverExemptList()
+		if len(exemptDst) > 0 {
+			log.Infof("nameserver exempt list: %v (proxy upstream in this list will not set SO_MARK)", exemptDst)
+		}
+		if err := iptables.SetupRedirect(15353, exemptDst); err != nil {
+			log.Fatalf("failed to install iptables redirect: %v", err)
+		}
+		log.Infof("iptables redirect configured (OUTPUT 53 -> 15353) with SO_MARK bypass for proxy upstream traffic")
 	}
-	if err := iptables.SetupRedirect(15353, exemptDst); err != nil {
-		log.Fatalf("failed to install iptables redirect: %v", err)
-	}
-	log.Infof("iptables redirect configured (OUTPUT 53 -> 15353) with SO_MARK bypass for proxy upstream traffic")
 
 	setupNft(ctx, nftMgr, initialRules, proxy, allowIPs, alwaysDeny, alwaysAllow)
 

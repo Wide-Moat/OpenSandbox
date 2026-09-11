@@ -61,8 +61,9 @@ See [Network Isolation](/architecture/network-isolation#allowing-legitimate-in-c
 ## Requirements
 
 - **Runtime**: Docker or Kubernetes.
-- **Capabilities**: `CAP_NET_ADMIN` (for the sidecar container only).
-- **Kernel**: Linux kernel with `iptables` support.
+- **Capabilities**: `CAP_NET_ADMIN` (for the sidecar container only). Not required when
+  `OPENSANDBOX_EGRESS_ENFORCEMENT=external` — see [Enforcement outside the pod](#enforcement-outside-the-pod).
+- **Kernel**: Linux kernel with `iptables` support. Also not required in that mode.
 - **Service mesh**: OpenSandbox egress is not currently supported inside pods that already have a transparent service-mesh sidecar (for example Istio/Envoy injection). Both layers rewrite outbound traffic in the same network namespace and can conflict.
 
 ## Configuration
@@ -74,6 +75,9 @@ Most deployments only need these settings:
 - **Mode**: `OPENSANDBOX_EGRESS_MODE`
   - `dns` (default): DNS filtering only
   - `dns+nft`: DNS + nftables IP/CIDR enforcement (recommended for strict default-deny)
+- **Enforcement**: `OPENSANDBOX_EGRESS_ENFORCEMENT`
+  - `sidecar` (default): this sidecar installs and owns the redirects
+  - `external`: something outside the pod enforces; see below
 - **Initial policy**:
   - `OPENSANDBOX_EGRESS_RULES` (JSON, same shape as `POST /policy`)
   - or `OPENSANDBOX_EGRESS_POLICY_FILE` (if valid file exists, it takes precedence at startup)
@@ -92,6 +96,50 @@ Optional advanced features:
 - DNS upstream health probe: `OPENSANDBOX_EGRESS_DNS_UPSTREAM_PROBE` (probe name; default is root IN NS, set an FQDN your resolvers always answer), `OPENSANDBOX_EGRESS_DNS_UPSTREAM_PROBE_INTERVAL_SEC` (default `30`)
 - Credential vault: `OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_REQUIRE_TLS`, `OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_REQUIRE_SCOPED_MATCH`, `OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_TRUSTED_PROXY_CIDRS`, `OPENSANDBOX_CREDENTIAL_PROXY_SOCKET` (default `/run/opensandbox/credential-proxy/active.sock`)
 - Metrics: `OPENSANDBOX_EGRESS_METRICS_EXTRA_ATTRS` (extra key=value attributes for OTLP metrics and structured log fields)
+
+### Enforcement Outside the Pod
+
+`OPENSANDBOX_EGRESS_ENFORCEMENT=external` tells the sidecar that egress is constrained
+by something outside the pod — a CNI-level policy on the host side of the veth, a
+resolver the sandbox is pointed at, an admission policy — and that it must not install
+netfilter rules of its own.
+
+This is the mode to use when the sandbox runs under a **sandboxed kernel such as
+gVisor**, which the [network isolation guide](../architecture/network-isolation.md#runtime-compatibility) recommends. There,
+nftables and iptables do not exist as subsystems and `CAP_NET_ADMIN` cannot be granted, so
+the default path does not merely degrade — it fails at startup:
+
+```
+failed to install iptables redirect: nft DNS redirect cleanup failed:
+  netlink: Error: cache initialization failed: Operation not permitted
+supervisor: crashloop budget exceeded
+```
+
+What changes with `external`:
+
+| | `sidecar` (default) | `external` |
+|---|---|---|
+| DNS redirect (`OUTPUT 53 → 15353`) | installed | not installed; point the sandbox's resolver at the proxy |
+| HTTP/HTTPS redirect | installed | not installed; clients use `HTTPS_PROXY` |
+| mitmproxy mode | `transparent` (destination from `SO_ORIGINAL_DST`) | `regular` (destination from `CONNECT`) |
+| `SO_MARK` on the proxy's own upstream queries | set, so the redirect can `RETURN` them | not set — there is no rule to bypass, and marking needs `CAP_NET_ADMIN` |
+| Credential vault | requires `OPENSANDBOX_EGRESS_MODE=dns+nft` | accepts `dns`; the address-level guarantee is made outside the pod |
+| `CAP_NET_ADMIN` | required | not required |
+
+**What still works unchanged**: the DNS filter and its allow/deny policy, the policy API,
+the credential vault and its HTTP API, the mitmproxy addon, CA export, and the supervisor.
+
+**What the operator must provide instead**, because the sidecar no longer does it:
+
+- a resolver configuration that sends the sandbox's DNS to this proxy (for example a pod
+  `dnsConfig` naming it), since nothing redirects port 53 any more;
+- `HTTPS_PROXY`/`HTTP_PROXY` in the sandbox pointing at the mitmproxy listener, and trust
+  for the exported CA, since nothing redirects 80/443 any more;
+- address-level egress enforcement outside the pod, since there is no nftables inside it.
+
+Setting this without providing those leaves the sandbox **unfiltered**, which is why the
+default is `sidecar` and an unrecognised value is refused at startup rather than treated
+as the default.
 
 ### Always-Rules Files
 

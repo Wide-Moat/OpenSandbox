@@ -103,11 +103,12 @@ func startMitmproxyTransparentIfEnabled() (*mitmTransparent, error) {
 		return nil, fmt.Errorf("%s: %w", constants.EnvMitmproxyExtraPorts, err)
 	}
 
-	cfg := mitmproxy.Config{
+	cfg := mitmproxy.ConfigFromEnv(mitmproxy.Config{
 		ListenPort:  mpPort,
 		UserName:    mitmproxy.RunAsUser,
 		ScriptPaths: parseScriptPaths(os.Getenv(constants.EnvMitmproxyScript)),
-	}
+	})
+	external := cfg.Regular
 	// Buffer absorbs a retry storm; correctness does not depend on the size
 	// (launchTagged sends block, so events are never silently dropped).
 	restartCh := make(chan exitEvent, 64)
@@ -122,10 +123,16 @@ func startMitmproxyTransparentIfEnabled() (*mitmTransparent, error) {
 	if err := mitmproxy.WaitListenPort(waitAddr, 15*time.Second); err != nil {
 		return nil, fmt.Errorf("wait listen %s: %w", waitAddr, err)
 	}
-	if err := iptables.SetupTransparentHTTP(mpPort, mpUID, dports); err != nil {
-		return nil, fmt.Errorf("iptables transparent: %w", err)
+	if external {
+		// No redirect to install, so nothing to be transparent about: clients come to
+		// mitmproxy as an explicit proxy and name the destination in CONNECT.
+		log.Infof("mitmproxy: regular proxy on 127.0.0.1:%d (enforcement=external; point clients at it with HTTPS_PROXY and trust the mitm CA)", mpPort)
+	} else {
+		if err := iptables.SetupTransparentHTTP(mpPort, mpUID, dports); err != nil {
+			return nil, fmt.Errorf("iptables transparent: %w", err)
+		}
+		log.Infof("mitmproxy: transparent intercept active (OUTPUT tcp %s -> %d; trust mitm CA in clients)", dports, mpPort)
 	}
-	log.Infof("mitmproxy: transparent intercept active (OUTPUT tcp %s -> %d; trust mitm CA in clients)", dports, mpPort)
 
 	if err := mitmproxy.SyncRootCA("", mpHome); err != nil {
 		return nil, fmt.Errorf("mitm CA export: %w", err)
