@@ -181,10 +181,17 @@ class DockerNetworkingMixin:
         ensure_credential_proxy_configured(
             request.credential_proxy, request.network_policy, self.app_config.egress
         )
+        # Deliberately NOT passing egress_config here, unlike the Kubernetes path.
+        #
+        # External enforcement means something outside the pod constrains the traffic --
+        # a CNI policy on the host side of the veth. The Docker runtime has no such
+        # thing, and _start_egress_sidecar below still adds NET_ADMIN and installs the
+        # redirects unconditionally. Accepting the setting here would make it a claim
+        # the sidecar does not honour: the validator would pass and the sandbox would be
+        # enforced the old way, with nothing saying so.
         ensure_egress_runtime_compatible(
             request.network_policy,
             self.app_config.secure_runtime,
-            egress_config=self.app_config.egress,
         )
 
     def _ensure_secure_access_support(self, request) -> None:

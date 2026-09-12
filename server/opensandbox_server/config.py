@@ -1393,7 +1393,18 @@ def _apply_env_overrides(config: AppConfig) -> None:
     if API_KEY_ENV_VAR in os.environ:
         config.server.api_key = os.environ[API_KEY_ENV_VAR]
     if TENANTS_AUTH_TOKEN_ENV_VAR in os.environ:
-        config.tenants.auth_token = os.environ[TENANTS_AUTH_TOKEN_ENV_VAR]
+        # `tenants` is None when the TOML has no [tenants] block, which is the ordinary
+        # single-tenant server. Setting the attribute there would raise AttributeError
+        # and refuse to start a configuration that is perfectly valid -- and the message
+        # would name neither the variable nor the missing block.
+        if config.tenants is None:
+            logger.warning(
+                "%s is set but the configuration has no [tenants] block; "
+                "the override applies to the HTTP tenant provider and is ignored here",
+                TENANTS_AUTH_TOKEN_ENV_VAR,
+            )
+        else:
+            config.tenants.auth_token = os.environ[TENANTS_AUTH_TOKEN_ENV_VAR]
     _apply_secure_access_env_overrides(config)
 
 

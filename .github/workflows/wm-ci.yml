@@ -25,6 +25,9 @@ on:
 
 # Read-only by default. The image job raises its own to packages: write, so the test
 # jobs run with a token that cannot publish anything.
+# Third-party actions are pinned to commit SHAs, not tags. The image job holds a token
+# that can publish to the organisation's registry, and a tag is a mutable pointer: an
+# upstream tag moved onto different code would run that code with those credentials.
 permissions:
   contents: read
 
@@ -38,7 +41,7 @@ jobs:
   changes-are-accounted-for:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # The check walks upstream-base..HEAD, so it needs the history and the tag.
           fetch-depth: 0
@@ -47,8 +50,8 @@ jobs:
   egress:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.25.9'
           cache-dependency-path: components/egress/go.sum
@@ -65,8 +68,8 @@ jobs:
   controller:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.25.9'
           cache-dependency-path: kubernetes/go.sum
@@ -82,8 +85,8 @@ jobs:
   server:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
       - run: pip install uv
@@ -100,20 +103,20 @@ jobs:
   tests-fail-without-the-changes:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.25.9'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
       - run: pip install uv
       - run: hack/wm-fail-on-base.sh
 
   images:
-    needs: [changes-are-accounted-for, egress, controller, server]
+    needs: [changes-are-accounted-for, egress, controller, server, tests-fail-without-the-changes]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -138,11 +141,11 @@ jobs:
             context: .
             dockerfile: components/ingress/Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.ref == 'refs/heads/wm' && github.event_name != 'pull_request'
         with:
           registry: ghcr.io
@@ -150,7 +153,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/wide-moat/opensandbox-${{ matrix.name }}
           tags: |
@@ -158,7 +161,7 @@ jobs:
             type=ref,event=branch
 
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}

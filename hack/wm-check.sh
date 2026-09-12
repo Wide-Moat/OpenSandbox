@@ -46,11 +46,17 @@ for sha in "${commits[@]}"; do
   done < <(git log -1 --format='%B' "$sha" | sed -n 's/^Wide-Moat-Change: *\(WM-[0-9][0-9]*\).*/\1/p')
 done
 
-in_commits=$(printf '%s\n' "${!seen_in_commit[@]}" | sort -V)
-in_notice=$(sed -n 's/^| *\*\*\(WM-[0-9][0-9]*\)\*\*.*/\1/p' "$notice" | sort -Vu)
+# LEXICAL sort, and a fixed locale, because `comm` below compares lexically and refuses
+# input sorted any other way. Version sort puts WM-10 after WM-2; lexical puts it before.
+# With five changes the two orders happen to agree, so this would have started lying at
+# the tenth -- and `comm` announcing "file 1 is not in sorted order" under `set -e` would
+# kill the script rather than report a drift.
+export LC_ALL=C
+in_commits=$(printf '%s\n' "${!seen_in_commit[@]}" | sort)
+in_notice=$(sed -n 's/^| *\*\*\(WM-[0-9][0-9]*\)\*\*.*/\1/p' "$notice" | sort -u)
 in_tests=$(grep -rhoE '(TestWM|test_wm)[0-9]+' \
              --include='*_test.go' --include='test_*.py' . 2>/dev/null \
-           | sed -E 's/^(TestWM|test_wm)/WM-/' | sort -Vu)
+           | sed -E 's/^(TestWM|test_wm)/WM-/' | sort -u)
 
 fail=0
 report() { # report <label> <a> <b> <a-name> <b-name>
