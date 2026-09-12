@@ -29,6 +29,11 @@ from typing import TYPE_CHECKING, Optional
 
 from kubernetes.client.exceptions import ApiException
 
+from opensandbox_server.config import (
+    EGRESS_ENFORCEMENT_EXTERNAL,
+    EGRESS_ENFORCEMENT_SIDECAR,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -256,8 +261,28 @@ async def _validate_k8s_runtime_class(
 
 
 def _warn_gvisor_egress_incompatibility(config: "AppConfig") -> None:
-    """Log a warning when gVisor is configured alongside an egress sidecar image."""
-    egress_image = config.egress.image if getattr(config, "egress", None) else None
+    """Log a warning when gVisor is configured alongside an egress sidecar image.
+
+    Not when ``[egress] enforcement`` is ``external``. The warning's last sentence is a
+    prediction -- that sandboxes carrying a network_policy will be rejected at creation
+    time -- and under external enforcement both validators that would do the rejecting
+    (``ensure_credential_proxy_configured`` and ``ensure_egress_runtime_compatible``)
+    return early instead. Printing it there promises a refusal that never comes, which
+    reads as a reason to abandon a configuration that is in fact the recommended one.
+
+    The enforcement value is read exactly as those validators read it, defaulting to
+    ``sidecar`` when the config or the field is absent, so an absent config means the
+    unchanged behaviour rather than silence.
+    """
+    egress_config = getattr(config, "egress", None)
+    egress_image = egress_config.image if egress_config else None
+    enforcement = (
+        egress_config.enforcement
+        if egress_config is not None and getattr(egress_config, "enforcement", None)
+        else EGRESS_ENFORCEMENT_SIDECAR
+    )
+    if enforcement == EGRESS_ENFORCEMENT_EXTERNAL:
+        return
     if config.secure_runtime and config.secure_runtime.type == "gvisor" and egress_image:
         logger.warning(
             "gVisor runtime is configured with egress sidecar image. "
