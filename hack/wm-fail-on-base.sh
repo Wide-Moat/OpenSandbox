@@ -101,6 +101,20 @@ is_exempt() {
     # still worth keeping: it fails the moment someone adds the variable to that list,
     # which would let a request unfilter its own sandbox.
     test_wm2_the_enforcement_variable_is_not_request_settable) return 0 ;;
+    # Asserts that a config with NO [tenants] block still loads when the variable
+    # happens to be set. Upstream never reads the variable, so there is nothing there
+    # to crash -- it passes on both trees, which is exactly what this script rejects.
+    #
+    # It is kept because the crash it guards against is introduced BY WM-4, not by
+    # upstream: `config.tenants` is None without the block, and assigning
+    # `config.tenants.auth_token` raises AttributeError. A single-tenant server would
+    # then refuse to start on a perfectly valid configuration, with a message naming
+    # neither the variable nor the block. Delete the None check in _apply_raw_env_overrides
+    # and this test goes red on OUR tree while still passing on upstream.
+    #
+    # That is the difference from a behaviour test: it does not describe what WM-4 adds,
+    # it describes what WM-4 must not break.
+    test_wm4_env_override_without_a_tenants_block_does_not_crash) return 0 ;;
     *) return 1 ;;
   esac
 }

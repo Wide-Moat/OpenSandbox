@@ -33,7 +33,7 @@ behaviour**, so the same diff that this fork carries is the one offered upstream
 | id | what | files | option, and its default | test | upstream |
 |---|---|---|---|---|---|
 | **WM-1** | The egress sidecar can be told that enforcement lives outside the pod: it then installs no DNS or HTTP redirect, sets no `SO_MARK`, runs mitmproxy as a regular forward proxy, and the credential vault stops requiring nftables | `components/egress/{main.go,shutdown.go,mitmproxy_transparent.go}`, `pkg/{constants,dnsproxy,credentialvault,mitmproxy}` | `OPENSANDBOX_EGRESS_ENFORCEMENT`, default `sidecar` | `TestWM1*` in four packages | not yet sent |
-| **WM-2** | The server configures that: no `NET_ADMIN` on the sidecar, the variable injected server-side, and the two validators that reject gVisor and non-`dns+nft` modes stop applying | `server/…/config.py`, `services/{constants,validators}.py`, `services/k8s/{egress_helper,create_helpers,workload_provider,batchsandbox_provider,agent_sandbox_provider,kubernetes_service}.py`, `services/docker/networking.py` | `[egress] enforcement`, default `"sidecar"` | `test_wm2_*` in `test_config.py`, `test_validators.py`, `k8s/test_egress_helper.py` | not yet sent |
+| **WM-2** | The server configures that: no `NET_ADMIN` on the sidecar, the variable injected server-side, the two validators that reject gVisor and non-`dns+nft` modes stop applying, and the startup warning that predicts those rejections stops being printed when they will not happen | `server/…/config.py`, `services/{constants,validators,runtime_resolver}.py`, `services/k8s/{egress_helper,create_helpers,workload_provider,batchsandbox_provider,agent_sandbox_provider,kubernetes_service}.py`, `services/docker/networking.py` | `[egress] enforcement`, default `"sidecar"` | `test_wm2_*` in `test_config.py`, `test_validators.py`, `test_runtime_resolver.py`, `k8s/test_egress_helper.py` | not yet sent |
 | **WM-4** | `[tenants] auth_token` can come from the environment, so the config file need not be a secret | `server/…/config.py` | `OPENSANDBOX_TENANTS_AUTH_TOKEN`, unset by default | `test_wm4_*` in `test_config.py` | not yet sent |
 | **WM-6** | The controller's cache can be scoped to named namespaces, so two installations can share a cluster | `kubernetes/cmd/controller/main.go`, `charts/opensandbox-controller` | `--watch-namespaces`, empty (cluster-wide) by default | `TestWM6*` in `cmd/controller` | not yet sent |
 | **WM-7** | The stop hook waits for mitmdump only when one was actually signalled — 51 ms against 1066 ms on every sandbox stop | `components/egress/scripts/cleanup.sh` | none; a plain fix | `TestWM7*` in `components/egress` | not yet sent |
@@ -41,12 +41,13 @@ behaviour**, so the same diff that this fork carries is the one offered upstream
 Every test here was **run against the unmodified tree first** and fails there on
 behaviour: the dialer still installs a `Control` hook, `Ready` still answers "requires
 dns+nft egress enforcement", the manifest still carries `NET_ADMIN`, `[egress]
-enforcement` is "accepted but not applied", the TOML value still beats the environment,
-the controller offers no `-watch-namespaces` among its flags, and the hook still waits
-1.046 s. Where naming a new symbol would have turned that into a compile error — which
-proves only that a symbol is missing, and goes green the moment one exists with nothing
-behind it — the test reaches the behaviour by another route: a literal variable name,
-`inspect.signature`, `dataclasses.fields`, or reflection.
+enforcement` is "accepted but not applied", the startup warning still predicts a
+rejection that external enforcement does not perform, the TOML value still beats the
+environment, the controller offers no `-watch-namespaces` among its flags, and the hook
+still waits 1.046 s. Where naming a new symbol would have turned that into a compile
+error — which proves only that a symbol is missing, and goes green the moment one exists
+with nothing behind it — the test reaches the behaviour by another route: a literal
+variable name, `inspect.signature`, `dataclasses.fields`, or reflection.
 
 ## Deliberately not carried
 
