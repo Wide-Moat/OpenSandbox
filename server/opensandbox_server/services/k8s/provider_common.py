@@ -29,6 +29,9 @@ from kubernetes.client import (
 )
 
 from opensandbox_server.api.schema import ImageSpec
+from opensandbox_server.config import (
+    _is_valid_kubernetes_container_resource_name,
+)
 from opensandbox_server.extensions.keys import ISOLATION_UPPER_MOUNT_PATH
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.helpers import parse_gpu_request
@@ -50,14 +53,6 @@ _GPU_RESOURCE_LIMIT_KEY = "gpu"
 # translated to nvidia.com/gpu below; ``disk`` is read by the Windows profile
 # (services/windows_common.py) and never reaches container resources.
 _PORTABLE_RESOURCE_LIMIT_KEYS = frozenset({_GPU_RESOURCE_LIMIT_KEY, "disk"})
-# Resource names Kubernetes accepts on a container without a vendor prefix.
-# Anything else must be a fully qualified extended resource ("vendor.com/name"),
-# or the API server refuses the pod with "must be a standard resource type or
-# fully qualified" -- and it refuses it at pod CREATION, long after this request
-# returned, so the caller sees a 60s readiness timeout rather than their mistake.
-_K8S_NATIVE_RESOURCE_NAMES = frozenset(
-    {"cpu", "memory", "ephemeral-storage", "hugepages-2Mi", "hugepages-1Gi"}
-)
 # Canonical extended-resource name advertised by the NVIDIA device plugin.
 # Hardcoded for parity with the Docker runtime fix (#775), which targets
 # NVIDIA only via DeviceRequest capabilities=[["gpu"]]. Other vendor keys
@@ -76,22 +71,24 @@ def _reject_unknown_resource_names(resource_limits: Dict[str, str]) -> None:
     ``KUBERNETES::POD_READY_TIMEOUT`` after sixty seconds and the real reason
     is visible only in namespace events.
 
-    Measured on lab stage 2026-09-15: a request carrying ``memoryMB`` and
-    ``diskMB`` -- plausible names, and neither of them real -- produced exactly
-    that. The sandbox was billed sixty seconds of the caller's time to deliver
-    an error that was knowable immediately.
+    ``memoryMB`` and ``diskMB`` are the plausible-looking example: neither is a
+    Kubernetes resource name, and a request carrying them costs the caller sixty
+    seconds to deliver an error that is knowable immediately.
 
-    A name is acceptable if it is one Kubernetes defines natively, or if it is
-    a fully qualified extended resource carrying a ``/``. The ``gpu`` key is
-    this API's own portable spelling and is translated below; ``disk`` is read
-    by the Windows profile before the pod is built. Both are allowed through.
+    Acceptability is decided by ``config._is_valid_kubernetes_container_resource_name``,
+    which already encodes the API server's rule. A second copy of that rule
+    here would be free to drift from it: the hugepage page size is whatever a
+    node advertises rather than a fixed set, and a qualified name needs a
+    DNS-subdomain prefix and a qualified-name suffix rather than merely a ``/``.
+
+    The two portable keys are exempt: ``gpu`` is translated below, and ``disk``
+    is read by the Windows profile before the pod is built.
     """
     unknown = sorted(
         key
         for key in resource_limits
         if key not in _PORTABLE_RESOURCE_LIMIT_KEYS
-        and "/" not in key
-        and key not in _K8S_NATIVE_RESOURCE_NAMES
+        and not _is_valid_kubernetes_container_resource_name(key)
     )
     if not unknown:
         return
@@ -102,13 +99,13 @@ def _reject_unknown_resource_names(resource_limits: Dict[str, str]) -> None:
             "code": SandboxErrorCodes.INVALID_PARAMETER,
             "message": (
                 "Kubernetes runtime cannot use resourceLimits "
-                f"{unknown}: a resource name must be one of "
-                f"{sorted(_K8S_NATIVE_RESOURCE_NAMES)}, a portable key "
-                f"{sorted(_PORTABLE_RESOURCE_LIMIT_KEYS)}, "
-                "or a fully qualified extended resource such as "
-                "'nvidia.com/gpu'. Memory and disk are expressed as Kubernetes "
-                "quantities, for example memory='512Mi' and "
-                "ephemeral-storage='2Gi'."
+                f"{unknown}: a resource name must be a Kubernetes container "
+                "resource ('cpu', 'memory', 'ephemeral-storage', "
+                "'hugepages-<size>'), a fully qualified extended resource such "
+                "as 'nvidia.com/gpu', or a portable key "
+                f"{sorted(_PORTABLE_RESOURCE_LIMIT_KEYS)}. Memory and disk are "
+                "expressed as Kubernetes quantities, for example "
+                "memory='512Mi' and ephemeral-storage='2Gi'."
             ),
         },
     )

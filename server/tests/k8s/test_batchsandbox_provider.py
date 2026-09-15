@@ -138,6 +138,36 @@ class TestBatchSandboxProvider:
 
     # ===== Workload Creation Tests =====
 
+    def test_create_workload_surfaces_invalid_resource_name_as_400(
+        self, mock_k8s_client
+    ):
+        """The 400 must reach the caller, not be swallowed on the way out.
+
+        This exercises create_workload rather than the translation helper
+        directly, because a guard that raises correctly is still useless if
+        something between it and the route turns it into a 500 or into a
+        created-then-failing workload. Nothing may be submitted to the API
+        server when the request cannot produce a valid pod.
+        """
+        provider = BatchSandboxProvider(mock_k8s_client)
+
+        with pytest.raises(HTTPException) as exc:
+            provider.create_workload(
+                sandbox_id="test-id",
+                namespace="test-ns",
+                image_spec=ImageSpec(uri="python:3.11"),
+                entrypoint=["/bin/bash"],
+                env={},
+                resource_limits={"cpu": "1", "memoryMB": "1024"},
+                labels={"opensandbox.io/id": "test-id"},
+                expires_at=datetime(2025, 12, 31, 10, 0, 0, tzinfo=timezone.utc),
+                execd_image="execd:latest",
+            )
+
+        assert exc.value.status_code == 400
+        assert "memoryMB" in exc.value.detail["message"]
+        mock_k8s_client.create_custom_object.assert_not_called()
+
     def test_create_workload_builds_correct_manifest(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)
         mock_k8s_client.create_custom_object.return_value = {
