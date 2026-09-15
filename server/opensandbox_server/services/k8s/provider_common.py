@@ -45,11 +45,73 @@ from opensandbox_server.services.k8s.security_context import (
 DEFAULT_ENTRYPOINT = ["tail", "-f", "/dev/null"]
 
 _GPU_RESOURCE_LIMIT_KEY = "gpu"
+# Portable keys this API defines itself, which are consumed before the pod is
+# built rather than passed to Kubernetes as resource names. ``gpu`` is
+# translated to nvidia.com/gpu below; ``disk`` is read by the Windows profile
+# (services/windows_common.py) and never reaches container resources.
+_PORTABLE_RESOURCE_LIMIT_KEYS = frozenset({_GPU_RESOURCE_LIMIT_KEY, "disk"})
+# Resource names Kubernetes accepts on a container without a vendor prefix.
+# Anything else must be a fully qualified extended resource ("vendor.com/name"),
+# or the API server refuses the pod with "must be a standard resource type or
+# fully qualified" -- and it refuses it at pod CREATION, long after this request
+# returned, so the caller sees a 60s readiness timeout rather than their mistake.
+_K8S_NATIVE_RESOURCE_NAMES = frozenset(
+    {"cpu", "memory", "ephemeral-storage", "hugepages-2Mi", "hugepages-1Gi"}
+)
 # Canonical extended-resource name advertised by the NVIDIA device plugin.
 # Hardcoded for parity with the Docker runtime fix (#775), which targets
 # NVIDIA only via DeviceRequest capabilities=[["gpu"]]. Other vendor keys
 # (e.g. amd.com/gpu, gpu.intel.com/i915) can be added as a follow-up.
 _K8S_NVIDIA_GPU_RESOURCE = "nvidia.com/gpu"
+
+
+def _reject_unknown_resource_names(resource_limits: Dict[str, str]) -> None:
+    """Refuse resource names Kubernetes cannot accept, at the API boundary.
+
+    ``ResourceLimits`` is an open map in the published schema, so any key is
+    accepted by request validation and carried through to the pod. Kubernetes
+    then rejects the pod itself with ``must be a standard resource type or
+    fully qualified``. That rejection happens during pod creation, after this
+    request has already returned, so the caller is told
+    ``KUBERNETES::POD_READY_TIMEOUT`` after sixty seconds and the real reason
+    is visible only in namespace events.
+
+    Measured on lab stage 2026-09-15: a request carrying ``memoryMB`` and
+    ``diskMB`` -- plausible names, and neither of them real -- produced exactly
+    that. The sandbox was billed sixty seconds of the caller's time to deliver
+    an error that was knowable immediately.
+
+    A name is acceptable if it is one Kubernetes defines natively, or if it is
+    a fully qualified extended resource carrying a ``/``. The ``gpu`` key is
+    this API's own portable spelling and is translated below; ``disk`` is read
+    by the Windows profile before the pod is built. Both are allowed through.
+    """
+    unknown = sorted(
+        key
+        for key in resource_limits
+        if key not in _PORTABLE_RESOURCE_LIMIT_KEYS
+        and "/" not in key
+        and key not in _K8S_NATIVE_RESOURCE_NAMES
+    )
+    if not unknown:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": SandboxErrorCodes.INVALID_PARAMETER,
+            "message": (
+                "Kubernetes runtime cannot use resourceLimits "
+                f"{unknown}: a resource name must be one of "
+                f"{sorted(_K8S_NATIVE_RESOURCE_NAMES)}, a portable key "
+                f"{sorted(_PORTABLE_RESOURCE_LIMIT_KEYS)}, "
+                "or a fully qualified extended resource such as "
+                "'nvidia.com/gpu'. Memory and disk are expressed as Kubernetes "
+                "quantities, for example memory='512Mi' and "
+                "ephemeral-storage='2Gi'."
+            ),
+        },
+    )
 
 
 def _translate_resource_limits_for_k8s(
@@ -78,6 +140,8 @@ def _translate_resource_limits_for_k8s(
     """
     if not resource_limits:
         return {}
+
+    _reject_unknown_resource_names(resource_limits)
 
     translated: Dict[str, str] = {
         key: value
