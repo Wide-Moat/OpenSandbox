@@ -48,11 +48,23 @@ from opensandbox_server.services.k8s.security_context import (
 DEFAULT_ENTRYPOINT = ["tail", "-f", "/dev/null"]
 
 _GPU_RESOURCE_LIMIT_KEY = "gpu"
-# Portable keys this API defines itself, which are consumed before the pod is
-# built rather than passed to Kubernetes as resource names. ``gpu`` is
-# translated to nvidia.com/gpu below; ``disk`` is read by the Windows profile
-# (services/windows_common.py) and never reaches container resources.
-_PORTABLE_RESOURCE_LIMIT_KEYS = frozenset({_GPU_RESOURCE_LIMIT_KEY, "disk"})
+# Portable keys this API defines itself, which are not Kubernetes resource names.
+#
+# ``gpu`` is translated to nvidia.com/gpu below.
+#
+# ``disk``, ``storage`` and ``ephemeral-storage`` are the Windows profile's disk
+# aliases: services/windows_common.py reads whichever is present into the
+# WINDOWS_DISK_SIZE env var. They are NOT removed from resource_limits there.
+# What keeps them off the container is windows_profile.py:114-141, which REBUILDS
+# ``main_container["resources"]`` from cpu and memory alone and discards the rest.
+# On a non-Windows sandbox no such rebuild happens, so ``ephemeral-storage`` --
+# which is a real Kubernetes resource name -- passes through the generic
+# translation and is applied, and ``disk``/``storage`` are accepted here only as
+# aliases the Windows path consumes.
+_WINDOWS_DISK_ALIAS_KEYS = frozenset({"disk", "storage"})
+_PORTABLE_RESOURCE_LIMIT_KEYS = frozenset(
+    {_GPU_RESOURCE_LIMIT_KEY} | _WINDOWS_DISK_ALIAS_KEYS
+)
 # Canonical extended-resource name advertised by the NVIDIA device plugin.
 # Hardcoded for parity with the Docker runtime fix (#775), which targets
 # NVIDIA only via DeviceRequest capabilities=[["gpu"]]. Other vendor keys
@@ -81,8 +93,9 @@ def _reject_unknown_resource_names(resource_limits: Dict[str, str]) -> None:
     node advertises rather than a fixed set, and a qualified name needs a
     DNS-subdomain prefix and a qualified-name suffix rather than merely a ``/``.
 
-    The two portable keys are exempt: ``gpu`` is translated below, and ``disk``
-    is read by the Windows profile before the pod is built.
+    The portable keys are exempt: ``gpu`` is translated below, and the Windows
+    disk aliases are read by the Windows profile. ``ephemeral-storage`` needs no
+    exemption -- it is a Kubernetes resource name and the validator accepts it.
     """
     unknown = sorted(
         key
