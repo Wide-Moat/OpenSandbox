@@ -37,6 +37,7 @@ behaviour**, so the same diff that this fork carries is the one offered upstream
 | **WM-4** | `[tenants] auth_token` can come from the environment, so the config file need not be a secret | `server/…/config.py` | `OPENSANDBOX_TENANTS_AUTH_TOKEN`, unset by default | `test_wm4_*` in `test_config.py` | not yet sent |
 | **WM-6** | The controller's cache can be scoped to named namespaces, so two installations can share a cluster | `kubernetes/cmd/controller/main.go`, `charts/opensandbox-controller` | `--watch-namespaces`, empty (cluster-wide) by default | `TestWM6*` in `cmd/controller` | not yet sent |
 | **WM-7** | The stop hook waits for mitmdump only when one was actually signalled — 51 ms against 1066 ms on every sandbox stop | `components/egress/scripts/cleanup.sh` | none; a plain fix | `TestWM7*` in `components/egress` | not yet sent |
+| **WM-8** | A pause with no snapshot registry records failure before stopping running tasks | `kubernetes/cmd/controller/main.go`, `internal/controller/batchsandbox_{controller,pause_resume}.go` | existing `--snapshot-registry`, empty by default; early refusal of an operation that cannot succeed | `TestWM8PausePreflight_MissingRegistryPreservesRunningTask` | not yet sent |
 
 Every test here was **run against the unmodified tree first** and fails there on
 behaviour: the dialer still installs a `Control` hook, `Ready` still answers "requires

@@ -236,6 +236,11 @@ copy components/egress/cleanup_sleep_test.go
 check WM-7 TestWM7NoSleepWhenNothingWasSignalled run_go components/egress . TestWM7NoSleepWhenNothingWasSignalled
 check WM-7 TestWM7StillSleepsWhenSomethingWasSignalled run_go components/egress . TestWM7StillSleepsWhenSomethingWasSignalled
 
+# WM-8 — pause must preserve tasks when snapshots cannot be configured.
+# The test uses reflection so upstream executes behavior instead of failing to compile.
+copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
+check WM-8 TestWM8PausePreflight_MissingRegistryPreservesRunningTask run_go kubernetes ./internal/controller TestWM8PausePreflight_MissingRegistryPreservesRunningTask
+
 echo
 if [ ${#BUILD_BROKE[@]} -gt 0 ]; then
   echo "FAIL: these did not compile against upstream, so they test a symbol rather than behaviour:" >&2

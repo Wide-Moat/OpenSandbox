@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,6 +33,15 @@ import (
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	taskscheduler "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/scheduler"
 )
+
+// Reflection keeps the behavioral regression executable on upstream, where the
+// registry field is absent. Missing configuration still reaches real pause code.
+func setPauseRegistryForTest(r *BatchSandboxReconciler, registry string) {
+	field := reflect.ValueOf(r).Elem().FieldByName("SnapshotRegistry")
+	if field.IsValid() && field.CanSet() && field.Kind() == reflect.String {
+		field.SetString(registry)
+	}
+}
 
 // pauseFixture builds a BatchSandbox that is being paused, plus its pod.
 func pauseFixture(name string) (*sandboxv1alpha1.BatchSandbox, *corev1.Pod) {
@@ -77,11 +87,11 @@ func pauseFixture(name string) (*sandboxv1alpha1.BatchSandbox, *corev1.Pod) {
 	return bs, pod
 }
 
-func TestPausePreflight_MissingRegistryPreservesRunningTask(t *testing.T) {
+func TestWM8PausePreflight_MissingRegistryPreservesRunningTask(t *testing.T) {
 	ctx := context.Background()
 	bs, pod := pauseFixture("missing-registry")
 	r := newTestReconciler(bs, pod)
-	r.SnapshotRegistry = ""
+	setPauseRegistryForTest(r, "")
 	scheduler := &recordingTaskScheduler{tasks: []taskscheduler.Task{fakeSchedulerTask{
 		name: bs.Name + "-0", state: taskscheduler.RunningTaskState, podName: pod.Name, released: false,
 	}}}
@@ -115,7 +125,7 @@ func TestPausePreflight_StatusFailureDoesNotAcknowledgeOrStop(t *testing.T) {
 	ctx := context.Background()
 	bs, pod := pauseFixture("status-error")
 	r := newTestReconciler(bs, pod)
-	r.SnapshotRegistry = ""
+	setPauseRegistryForTest(r, "")
 	underlying := r.Client
 	r.Client = interceptor.NewClient(underlying.(client.WithWatch), interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -149,7 +159,7 @@ func TestPausePreflight_NewRequestAfterRegistryConfigured(t *testing.T) {
 	ctx := context.Background()
 	bs, pod := pauseFixture("retry")
 	r := newTestReconciler(bs, pod)
-	r.SnapshotRegistry = ""
+	setPauseRegistryForTest(r, "")
 	scheduler := &recordingTaskScheduler{tasks: []taskscheduler.Task{fakeSchedulerTask{
 		name: pod.Name, state: taskscheduler.RunningTaskState, podName: pod.Name, released: false,
 	}}}
@@ -158,7 +168,7 @@ func TestPausePreflight_NewRequestAfterRegistryConfigured(t *testing.T) {
 	_, _, err := r.dispatchPauseResume(ctx, bs)
 	require.NoError(t, err)
 	assert.Zero(t, scheduler.stopCalls)
-	r.SnapshotRegistry = "registry.example.invalid/snapshots"
+	setPauseRegistryForTest(r, "registry.example.invalid/snapshots")
 	require.NoError(t, r.Get(ctx, key, bs))
 	bs.Generation++
 	require.NoError(t, r.Update(ctx, bs))
