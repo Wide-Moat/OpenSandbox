@@ -110,6 +110,8 @@ Sandbox lifecycle:   [Running]--[Pausing]--[Paused]--[Resuming]--[Running]
 Current pause/resume support is limited to `BatchSandbox.spec.replicas=1`. The OpenSandbox server creates Kubernetes sandboxes with `replicas: 1`; direct `BatchSandbox` CRs with any other replica count are rejected by the controller pause entry because the internal pause snapshot records one source Pod's container images.
 :::
 
+When `--snapshot-registry` is empty, a new pause request is rejected with a `PauseFailed` condition and reason `RegistryNotConfigured` before task cleanup or snapshot creation. The sandbox remains in its current phase and its tasks remain running. Configure the registry and submit a new pause request to retry. This check does not establish that the selected runtime supports snapshots.
+
 ### The SandboxSnapshot CRD
 
 The `SandboxSnapshot` CR is the central resource for pause/resume lifecycle:
