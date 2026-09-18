@@ -138,6 +138,36 @@ class TestBatchSandboxProvider:
 
     # ===== Workload Creation Tests =====
 
+    def test_create_workload_surfaces_invalid_resource_name_as_400(
+        self, mock_k8s_client
+    ):
+        """The 400 must reach the caller, not be swallowed on the way out.
+
+        This exercises create_workload rather than the translation helper
+        directly, because a guard that raises correctly is still useless if
+        something between it and the route turns it into a 500 or into a
+        created-then-failing workload. Nothing may be submitted to the API
+        server when the request cannot produce a valid pod.
+        """
+        provider = BatchSandboxProvider(mock_k8s_client)
+
+        with pytest.raises(HTTPException) as exc:
+            provider.create_workload(
+                sandbox_id="test-id",
+                namespace="test-ns",
+                image_spec=ImageSpec(uri="python:3.11"),
+                entrypoint=["/bin/bash"],
+                env={},
+                resource_limits={"cpu": "1", "memoryMB": "1024"},
+                labels={"opensandbox.io/id": "test-id"},
+                expires_at=datetime(2025, 12, 31, 10, 0, 0, tzinfo=timezone.utc),
+                execd_image="execd:latest",
+            )
+
+        assert exc.value.status_code == 400
+        assert "memoryMB" in exc.value.detail["message"]
+        mock_k8s_client.create_custom_object.assert_not_called()
+
     def test_create_workload_builds_correct_manifest(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)
         mock_k8s_client.create_custom_object.return_value = {
@@ -199,6 +229,57 @@ class TestBatchSandboxProvider:
         node_selector = body["spec"]["template"]["spec"]["nodeSelector"]
         assert node_selector["kubernetes.io/os"] == "linux"
         assert node_selector["kubernetes.io/arch"] == "arm64"
+
+    def test_create_workload_windows_profile_accepts_storage_alias(
+        self, mock_k8s_client
+    ):
+        """'storage' is a pre-existing Windows alias for disk and must survive.
+
+        windows_common.py:143 reads disk / storage / ephemeral-storage into the
+        Windows disk env var. The resource-name guard runs first -- the pod is
+        built at batchsandbox_provider.py:212, before the Windows overrides at
+        :238 -- so a guard that knows only Kubernetes names rejects 'storage'
+        before the Windows path ever sees it.
+
+        This drives the real provider and asserts both halves: the alias reaches
+        the Windows disk configuration, and it is absent from the final container
+        resource keys.
+        """
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="dockurr/windows:latest"),
+            entrypoint=["cmd", "/c", "echo hello"],
+            env={"VERSION": "11"},
+            resource_limits={"cpu": "4", "memory": "8G", "storage": "64G"},
+            labels={"opensandbox.io/id": "test-id"},
+            expires_at=None,
+            execd_image="execd:latest",
+            platform=PlatformSpec(os="windows", arch="amd64"),
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        main = next(
+            c for c in pod_spec["containers"] if c["name"] not in ("execd", "egress")
+        )
+
+        # The alias reached the Windows disk configuration.
+        disk_env = {e["name"]: e["value"] for e in main.get("env", []) if "value" in e}
+        assert disk_env.get("DISK_SIZE") == "64G"
+
+        # And it is not a Kubernetes resource name on the container.
+        resource_keys = set(main.get("resources", {}).get("limits", {})) | set(
+            main.get("resources", {}).get("requests", {})
+        )
+        assert "storage" not in resource_keys
+        assert "disk" not in resource_keys
+        assert resource_keys <= {"cpu", "memory"}
 
     def test_create_workload_windows_profile_uses_windows_runtime_shape(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)

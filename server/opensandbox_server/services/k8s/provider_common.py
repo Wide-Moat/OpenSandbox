@@ -31,6 +31,9 @@ from kubernetes.client import (
 )
 
 from opensandbox_server.api.schema import ImageSpec
+from opensandbox_server.config import (
+    _is_valid_kubernetes_container_resource_name,
+)
 from opensandbox_server.extensions.keys import ISOLATION_UPPER_MOUNT_PATH
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.helpers import parse_gpu_request
@@ -47,11 +50,80 @@ from opensandbox_server.services.k8s.security_context import (
 DEFAULT_ENTRYPOINT = ["tail", "-f", "/dev/null"]
 
 _GPU_RESOURCE_LIMIT_KEY = "gpu"
+# Portable keys this API defines itself, which are not Kubernetes resource names.
+#
+# ``gpu`` is translated to nvidia.com/gpu below.
+#
+# ``disk``, ``storage`` and ``ephemeral-storage`` are the Windows profile's disk
+# aliases: services/windows_common.py reads whichever is present into the
+# WINDOWS_DISK_SIZE env var. They are NOT removed from resource_limits there.
+# What keeps them off the container is windows_profile.py:114-141, which REBUILDS
+# ``main_container["resources"]`` from cpu and memory alone and discards the rest.
+# On a non-Windows sandbox no such rebuild happens, so ``ephemeral-storage`` --
+# which is a real Kubernetes resource name -- passes through the generic
+# translation and is applied, and ``disk``/``storage`` are accepted here only as
+# aliases the Windows path consumes.
+_WINDOWS_DISK_ALIAS_KEYS = frozenset({"disk", "storage"})
+_PORTABLE_RESOURCE_LIMIT_KEYS = frozenset(
+    {_GPU_RESOURCE_LIMIT_KEY} | _WINDOWS_DISK_ALIAS_KEYS
+)
 # Canonical extended-resource name advertised by the NVIDIA device plugin.
 # Hardcoded for parity with the Docker runtime fix (#775), which targets
 # NVIDIA only via DeviceRequest capabilities=[["gpu"]]. Other vendor keys
 # (e.g. amd.com/gpu, gpu.intel.com/i915) can be added as a follow-up.
 _K8S_NVIDIA_GPU_RESOURCE = "nvidia.com/gpu"
+
+
+def _reject_unknown_resource_names(resource_limits: Dict[str, str]) -> None:
+    """Refuse resource names Kubernetes cannot accept, at the API boundary.
+
+    ``ResourceLimits`` is an open map in the published schema, so any key is
+    accepted by request validation and carried through to the pod. Kubernetes
+    then rejects the pod itself with ``must be a standard resource type or
+    fully qualified``. That rejection happens during pod creation, after this
+    request has already returned, so the caller is told
+    ``KUBERNETES::POD_READY_TIMEOUT`` after sixty seconds and the real reason
+    is visible only in namespace events.
+
+    ``memoryMB`` and ``diskMB`` are the plausible-looking example: neither is a
+    Kubernetes resource name, and a request carrying them costs the caller sixty
+    seconds to deliver an error that is knowable immediately.
+
+    Acceptability is decided by ``config._is_valid_kubernetes_container_resource_name``,
+    which already encodes the API server's rule. A second copy of that rule
+    here would be free to drift from it: the hugepage page size is whatever a
+    node advertises rather than a fixed set, and a qualified name needs a
+    DNS-subdomain prefix and a qualified-name suffix rather than merely a ``/``.
+
+    The portable keys are exempt: ``gpu`` is translated below, and the Windows
+    disk aliases are read by the Windows profile. ``ephemeral-storage`` needs no
+    exemption -- it is a Kubernetes resource name and the validator accepts it.
+    """
+    unknown = sorted(
+        key
+        for key in resource_limits
+        if key not in _PORTABLE_RESOURCE_LIMIT_KEYS
+        and not _is_valid_kubernetes_container_resource_name(key)
+    )
+    if not unknown:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": SandboxErrorCodes.INVALID_PARAMETER,
+            "message": (
+                "Kubernetes runtime cannot use resourceLimits "
+                f"{unknown}: a resource name must be a Kubernetes container "
+                "resource ('cpu', 'memory', 'ephemeral-storage', "
+                "'hugepages-<size>'), a fully qualified extended resource such "
+                "as 'nvidia.com/gpu', or a portable key "
+                f"{sorted(_PORTABLE_RESOURCE_LIMIT_KEYS)}. Memory and disk are "
+                "expressed as Kubernetes quantities, for example "
+                "memory='512Mi' and ephemeral-storage='2Gi'."
+            ),
+        },
+    )
 
 
 def _translate_resource_limits_for_k8s(
@@ -80,6 +152,8 @@ def _translate_resource_limits_for_k8s(
     """
     if not resource_limits:
         return {}
+
+    _reject_unknown_resource_names(resource_limits)
 
     translated: Dict[str, str] = {
         key: value

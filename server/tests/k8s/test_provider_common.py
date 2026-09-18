@@ -134,3 +134,91 @@ def test_platform_constraint_scope_pod_template_key_alias():
         workload, "podTemplate", _analyzer
     )
     assert has_platform is True
+
+
+# ---------------------------------------------------------------------------
+# Resource names Kubernetes cannot accept (regression: lab stage 2026-09-15)
+# ---------------------------------------------------------------------------
+
+
+def test_translate_resource_limits_rejects_unknown_names():
+    """memoryMB/diskMB must fail here, not later as a pod-creation event.
+
+    Neither is a Kubernetes resource name. Carried into the pod they are
+    refused by the API server with "must be a standard resource type or fully
+    qualified", long after the create request returned, so the caller sees a
+    readiness timeout instead of the real reason.
+    """
+    with pytest.raises(HTTPException) as exc:
+        _translate_resource_limits_for_k8s(
+            {"cpu": "1", "memoryMB": "1024", "diskMB": "2048"}
+        )
+    assert exc.value.status_code == 400
+    message = exc.value.detail["message"]
+    # Both offending names are reported, not just the first one found.
+    assert "memoryMB" in message and "diskMB" in message
+    # The message must say what IS acceptable, or it only tells the caller they
+    # are wrong without telling them what to write instead.
+    assert "ephemeral-storage" in message and "512Mi" in message
+
+
+def test_translate_resource_limits_allows_native_names():
+    """The control: valid names must still pass, or the guard rejects everything."""
+    result = _translate_resource_limits_for_k8s(
+        {"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "2Gi"}
+    )
+    assert result == {"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "2Gi"}
+
+
+def test_translate_resource_limits_allows_qualified_extended_resources():
+    """A vendor-qualified name is legal to Kubernetes and must not be refused."""
+    result = _translate_resource_limits_for_k8s({"cpu": "1", "amd.com/gpu": "1"})
+    assert result == {"cpu": "1", "amd.com/gpu": "1"}
+
+
+def test_translate_resource_limits_still_translates_portable_gpu():
+    """The portable 'gpu' key is this API's own spelling and must survive the guard."""
+    result = _translate_resource_limits_for_k8s({"cpu": "1", "gpu": "2"})
+    assert result == {"cpu": "1", "nvidia.com/gpu": "2"}
+
+
+def test_translate_resource_limits_allows_portable_disk_key():
+    """'disk' is this API's own portable key, consumed by the Windows profile.
+
+    It is not a Kubernetes resource name, so a guard derived only from
+    Kubernetes would reject it. It never reaches container resources, so it
+    must pass through here.
+    """
+    result = _translate_resource_limits_for_k8s({"cpu": "1", "disk": "20Gi"})
+    assert result == {"cpu": "1", "disk": "20Gi"}
+
+
+def test_translate_resource_limits_allows_other_hugepage_sizes():
+    """Page size is whatever the node advertises, not a fixed pair.
+
+    A guard hardcoding hugepages-2Mi and hugepages-1Gi silently refuses
+    hugepages-32Mi, a name the API server accepts.
+    """
+    result = _translate_resource_limits_for_k8s(
+        {"cpu": "1", "hugepages-32Mi": "128Mi", "hugepages-512Mi": "1Gi"}
+    )
+    assert result == {
+        "cpu": "1",
+        "hugepages-32Mi": "128Mi",
+        "hugepages-512Mi": "1Gi",
+    }
+
+
+def test_translate_resource_limits_rejects_malformed_qualified_names():
+    """A slash does not make a name qualified.
+
+    Kubernetes requires a DNS-subdomain prefix and a qualified-name suffix, so
+    '/gpu' (empty prefix), 'vendor.com/' (empty resource) and 'UPPER/gpu'
+    (uppercase in the prefix) are all refused. Treating any name containing a
+    slash as valid lets these reach the pod.
+    """
+    for bad in ("/gpu", "vendor.com/", "UPPER/gpu"):
+        with pytest.raises(HTTPException) as exc:
+            _translate_resource_limits_for_k8s({"cpu": "1", bad: "1"})
+        assert exc.value.status_code == 400
+        assert bad in exc.value.detail["message"]
