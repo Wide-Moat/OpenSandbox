@@ -465,6 +465,7 @@ func main() {
 		Scheme:              mgr.GetScheme(),
 		Recorder:            mgr.GetEventRecorderFor("batchsandbox-controller"),
 		ResumePullSecret:    resumePullSecret,
+		SnapshotRegistry:    snapshotRegistry,
 		ProfileStore:        profileStore,
 		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
 	}).SetupWithManager(mgr, batchSandboxConcurrency); err != nil {
