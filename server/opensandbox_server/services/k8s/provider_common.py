@@ -22,6 +22,8 @@ from kubernetes.client import (
     V1Capabilities,
     V1Container,
     V1EnvVar,
+    V1HTTPGetAction,
+    V1Probe,
     V1ResourceRequirements,
     V1SeccompProfile,
     V1SecurityContext,
@@ -229,6 +231,30 @@ def _build_main_container(
         resources=resources,
         volume_mounts=volume_mounts,
         security_context=security_context,
+        # ⚠ WITHOUT THIS A SANDBOX IS "READY" BEFORE IT CAN RUN ANYTHING.
+        #
+        # The create path returns to the caller once the workload reports Running,
+        # and Running for a BatchSandbox means PodsReady. With no probe the kubelet
+        # has nothing to ask, so the pod is Ready the moment the container process
+        # starts -- which is before execd is listening. The caller then gets a
+        # sandbox id for a sandbox that refuses the next request, and the failure
+        # looks like a flaky client rather than a readiness gap.
+        #
+        # It matters twice over for a warm pool: the controller hands out only Ready
+        # pods, so "ready" is the entire contract of a pre-warmed pod. A pool whose
+        # pods are Ready before their agent is serves them exactly as slowly as a
+        # cold create, and nothing reports it.
+        #
+        # 60 x 1 s of headroom: execd comes up in about 5 s, and the rest covers a
+        # cold node. A sandbox that needs longer than a minute is not one worth
+        # handing out.
+        readiness_probe=V1Probe(
+            # 44772 as a literal, the way every other reference to execd's port in
+            # this codebase spells it; there is no named constant to reuse.
+            http_get=V1HTTPGetAction(path="/ping", port=44772),
+            period_seconds=1,
+            failure_threshold=60,
+        ),
     )
 
 
@@ -256,6 +282,19 @@ def _container_to_dict(container: V1Container) -> Dict[str, Any]:
             {"name": vm.name, "mountPath": vm.mount_path}
             for vm in container.volume_mounts
         ]
+    # ⚠ THE SECOND HALF OF THE PROBE CHANGE, and without it the first half is a
+    # silent no-op. This function serialises a container BY HAND, field by field,
+    # and a field it does not name simply does not reach the pod spec. The probe
+    # object would be built, the code would read as correct, and the rendered pod
+    # would carry readinessProbe: null -- a defect invisible in the source and
+    # visible only on a live pod.
+    if container.readiness_probe and container.readiness_probe.http_get:
+        http_get = container.readiness_probe.http_get
+        result["readinessProbe"] = {
+            "httpGet": {"path": http_get.path, "port": http_get.port},
+            "periodSeconds": container.readiness_probe.period_seconds,
+            "failureThreshold": container.readiness_probe.failure_threshold,
+        }
     if container.security_context:
         security_context_dict = serialize_security_context_to_dict(container.security_context)
         if security_context_dict:
