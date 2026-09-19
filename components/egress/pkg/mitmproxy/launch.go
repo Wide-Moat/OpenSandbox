@@ -167,7 +167,21 @@ func buildMitmdumpArgs(cfg Config) []string {
 		"--set", "flow_detail=0",
 	}
 	if cfg.Regular {
-		args = append(args, "--set", "mode=regular")
+		// ⚠ `--mode`, NOT `--set mode=`. The config file shipped in this image sets
+		// `mode: [transparent]`, and `mode` is a SEQUENCE option: `--set mode=regular`
+		// does not replace that list, so mitmdump keeps waiting for a transparently
+		// redirected connection. With enforcement=external there is no redirect to wait
+		// for, so every client connection is closed without a byte -- the symptom is
+		// `Connection reset by peer` from inside the sandbox while the process is alive,
+		// listening, and logging nothing at all.
+		//
+		// Measured in a live sidecar, one variable at a time, with the same HOME the
+		// sidecar uses so the same config file is read:
+		//   HOME=/var/lib/mitmproxy mitmdump -s system.py                  -> reset
+		//   HOME=/var/lib/mitmproxy mitmdump --mode regular -s system.py   -> HTTP 401
+		// The 401 is file-gate refusing an unauthenticated request, which is the proof
+		// the request reached it.
+		args = append(args, "--mode", "regular")
 	}
 	if strings.TrimSpace(cfg.ListenHost) != "" {
 		args = append(args, "--listen-host", cfg.ListenHost)
