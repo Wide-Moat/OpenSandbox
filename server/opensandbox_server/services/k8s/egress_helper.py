@@ -31,6 +31,7 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_ENFORCEMENT,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
+    OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED,
     OPENSANDBOX_EGRESS_TOKEN,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
@@ -113,6 +114,19 @@ def apply_egress_to_spec(
         env.append({"name": OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT, "value": "true"})
     if egress_settings.auth_token:
         env.append({"name": OPENSANDBOX_EGRESS_TOKEN, "value": egress_settings.auth_token})
+    if egress_settings.credential_vault_seed:
+        # ⚠ THE SIDECAR'S OWN ENVIRONMENT, NEVER THE SHARED VOLUME. The sandbox container
+        # mounts the same /opt/opensandbox the sidecar does -- it is where the sandbox
+        # reads the proxy CA -- so a seed written there would be readable by exactly the
+        # code the credential vault exists to keep the credential away from. Containers
+        # do not share an environment, which is why the sidecar's own auth token above
+        # already travels this way.
+        env.append(
+            {
+                "name": OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED,
+                "value": json.dumps(egress_settings.credential_vault_seed),
+            }
+        )
     if egress_settings.env:
         for name, value in egress_settings.env.items():
             if (

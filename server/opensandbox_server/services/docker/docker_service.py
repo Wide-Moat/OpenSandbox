@@ -90,6 +90,7 @@ from opensandbox_server.services.docker.windows_profile import (
 from opensandbox_server.services.extension_service import ExtensionService
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
+    OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
@@ -826,6 +827,16 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                         if not entry.startswith(f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=")
                     ]
                     environment.append(f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=true")
+                    # The seed travels on the SIDECAR's own environment, never on a path
+                    # the sandbox container can read: the two share /opt/opensandbox,
+                    # which is where the sandbox reads the proxy CA, so a seed placed
+                    # there would be readable by exactly the code the vault exists to
+                    # keep the credential away from.
+                    seed = request.credential_proxy.seed if request.credential_proxy else None
+                    if seed:
+                        environment.append(
+                            f"{OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED}={json.dumps(seed)}"
+                        )
 
                 egress_token = generate_egress_token()
                 labels[SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY] = egress_token

@@ -89,6 +89,12 @@ func startPolicyServer(
 	handler.credentialVault = credentialvault.NewStore(mitmGate, func() bool { return strings.TrimSpace(token) != "" })
 	handler.credentialVaultRequireTLS = constants.IsTruthy(os.Getenv(constants.EnvCredentialVaultRequireTLS))
 	handler.setAlwaysRules(alwaysDeny, alwaysAllow)
+	// ⚠ AFTER setAlwaysRules, NOT BEFORE. The seed is validated against
+	// effectivePolicy, which merges the always-allow/always-deny overlay; seeding first
+	// would judge it against the user policy alone and refuse a binding whose
+	// destination the overlay permits -- the same request would then succeed over the
+	// API, which is the kind of difference nobody thinks to look for.
+	handler.seedCredentialVault(os.Getenv(constants.EnvCredentialVaultSeedFile), os.Getenv(constants.EnvCredentialVaultSeed))
 
 	mux.HandleFunc("/policy", handler.handlePolicy)
 	mux.HandleFunc("/credential-vault", handler.handleCredentialVault)
@@ -210,6 +216,87 @@ func (s *policyServer) handlePolicy(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST, PUT, PATCH, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// seedCredentialVault fills the vault from a file before the first request, so a
+// credential is in place for anything the sandbox does at boot.
+//
+// ⚠ IT NEVER FAILS THE SIDECAR. A seed that cannot be read or does not parse leaves the
+// vault exactly as it was -- empty, fillable over the API -- because the sandbox this
+// sidecar guards must still start. The failure is logged and nothing else: refusing to
+// run would turn a missing credential into no sandbox at all, which is strictly worse
+// than the fallback every client already has.
+//
+// ⚠ AND IT IS NOT A SECOND WAY IN. The file is validated by the same Store.Create the
+// API uses, against the same policy, so a seed cannot express a binding the API would
+// reject. If the vault already exists the seed is skipped rather than merged: two
+// sources for one vault is how a binding silently becomes something nobody wrote.
+func (s *policyServer) seedCredentialVault(path, inline string) {
+	// Unset means no seeding: the default is today's behaviour, an empty vault filled
+	// over the API.
+	//
+	// ⚠ THIS GUARD IS NOT OBSERVABLE FROM OUTSIDE, and saying so is better than a test
+	// that pretends otherwise. `os.ReadFile("")` fails too, so removing the guard
+	// changes nothing a caller can see -- proven by deleting it and watching every test
+	// here stay green, including one written specifically to catch it. It stays because
+	// "unset" is a decision and reads as one, and because the log line it avoids would
+	// otherwise appear on every sandbox that never asked for a seed.
+	path = strings.TrimSpace(path)
+	inline = strings.TrimSpace(inline)
+	var (
+		data   []byte
+		source string
+	)
+	switch {
+	case path != "":
+		// The file wins when both are set: a path is the more deliberate of the two, and
+		// silently preferring the other would make a stale variable outrank it.
+		read, err := os.ReadFile(path)
+		if err != nil {
+			log.Warnf("credential vault seed: cannot read %s (%v); the vault starts empty", path, err)
+			return
+		}
+		data, source = read, path
+	case inline != "":
+		data, source = []byte(inline), constants.EnvCredentialVaultSeed
+	default:
+		return
+	}
+	var req credentialvault.CreateRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		log.Warnf("credential vault seed: %s is not a CreateRequest (%v); the vault starts empty", source, err)
+		return
+	}
+	if len(req.Credentials) == 0 && len(req.Bindings) == 0 {
+		log.Warnf("credential vault seed: %s names no credential and no binding; the vault starts empty", source)
+		return
+	}
+	// ⚠ THE SAME PRECONDITIONS THE API ENFORCES, or this is a way round them. Ready()
+	// refuses a vault with no auth token, without transparent mitmproxy, with insecure
+	// upstream TLS, and without in-pod enforcement where that is what guarantees a
+	// credential cannot be reached by another route. A seed that skipped them would
+	// inject a credential over unverified TLS in a configuration where POST is refused
+	// outright -- found by review, not by me.
+	//
+	// The mitmproxy readiness wait inside Ready() is the one part that cannot apply
+	// here: mitmdump starts only after this server does, so waiting would deadlock
+	// startup. A context already past its deadline runs every static check and skips
+	// that wait, which is exactly the subset that applies before the proxy exists.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := s.credentialVault.Ready(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		if !strings.Contains(err.Error(), "credential proxy is not ready") {
+			log.Warnf("credential vault seed: %s refused (%v); the vault starts empty", source, err)
+			return
+		}
+	}
+	pol := s.effectivePolicy()
+	if _, err := s.credentialVault.Create(req, pol); err != nil {
+		log.Warnf("credential vault seed: %s was refused (%v); the vault starts empty", source, err)
+		return
+	}
+	log.Infof("credential vault seed: %d credential(s) and %d binding(s) loaded from %s before the first request",
+		len(req.Credentials), len(req.Bindings), source)
 }
 
 func (s *policyServer) handleCredentialVault(w http.ResponseWriter, r *http.Request) {

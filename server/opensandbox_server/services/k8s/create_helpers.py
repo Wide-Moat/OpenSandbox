@@ -124,6 +124,9 @@ def _build_create_workload_context(
             mode=egress_config.mode,
             auth_token=egress_auth_token,
             credential_proxy_enabled=credential_proxy_enabled,
+            credential_vault_seed=(
+                request.credential_proxy.seed if request.credential_proxy else None
+            ),
             env=egress_env,
             disable_ipv6=egress_config.disable_ipv6,
             resource_requests=egress_config.requests,

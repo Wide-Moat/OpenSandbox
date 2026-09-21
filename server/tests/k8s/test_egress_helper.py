@@ -795,3 +795,98 @@ class TestSplitEgressEnv:
         env = {key: "val" for key in ALLOWED_EGRESS_ENV_VARS}
         sandbox_env, egress_env = split_egress_env(env)
         assert set(egress_env.keys()) == ALLOWED_EGRESS_ENV_VARS
+
+
+# WM-8. The vault can be filled before the sandbox starts, because the API cannot be
+# reached in time for anything the sandbox does at boot: the client writes the vault only
+# after the create call returns, the server does not answer it until the pod is Ready, and
+# the pod is not Ready until its own startup has finished.
+
+# ⚠ THE LITERAL NAME, NOT THE IMPORTED CONSTANT. `hack/wm-fail-on-base.sh` copies these
+# tests into an unmodified upstream tree and requires them to FAIL there -- a test that
+# cannot compile proves only that a symbol is missing, and would go green the moment one
+# existed with nothing behind it. Spelling the variable out lets the test build against a
+# tree that has never heard of it and fail on the answer instead.
+
+# ⚠ SET REFLECTIVELY, NEVER AS A KEYWORD. `hack/wm-fail-on-base.sh` copies these tests
+# into an unmodified upstream tree and requires them to FAIL there; it classifies
+# "unexpected keyword" as a BUILD break, on the grounds that a test which cannot compile
+# proves only that a symbol is missing and would go green the moment one existed with
+# nothing behind it. Assigning the attribute afterwards builds on either tree: upstream's
+# dataclass simply never renders it, and the assertion fails on the answer.
+def _with_wm8_seed(settings, seed):
+    if seed is not None:
+        object.__setattr__(settings, "credential_vault_seed", seed)
+    return settings
+
+
+_WM8_SEED_ENV = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED"
+
+_WM8_SEED = {
+    "credentials": [{"name": "k", "source": {"type": "inline", "value": "s3cret-value"}}],
+    "bindings": [
+        {
+            "name": "b",
+            "match": {"hosts": ["files.example.com"]},
+            "auth": {"type": "bearer", "credential": "k"},
+        }
+    ],
+}
+
+
+def _wm8_sidecar_env(seed):
+    policy = NetworkPolicy(
+        defaultAction="deny",
+        egress=[NetworkRule(action="allow", target="files.example.com")],
+    )
+    containers: list = []
+    apply_egress_to_spec(
+        containers,
+        _with_wm8_seed(_egress_settings(policy, credential_proxy_enabled=True), seed),
+        "sbx-1",
+    )
+    sidecar = next(c for c in containers if c["name"] == "egress")
+    return {e["name"]: e["value"] for e in sidecar["env"]}
+
+
+def test_wm8_seed_travels_in_the_sidecar_environment():
+    env = _wm8_sidecar_env(_WM8_SEED)
+    assert _WM8_SEED_ENV in env
+    assert json.loads(env[_WM8_SEED_ENV]) == _WM8_SEED
+
+
+def test_wm8_no_seed_is_the_default():
+    env = _wm8_sidecar_env(None)
+    assert _WM8_SEED_ENV not in env
+
+
+def test_wm8_the_secret_reaches_the_sidecar_and_nothing_else():
+    """The sandbox container must not be able to read it.
+
+    The one volume the two containers share is where the sandbox reads the proxy CA, so a
+    seed placed there would be readable by exactly the code the credential vault exists to
+    keep the credential away from. An environment is per-container, which is why the
+    sidecar's own auth token already travels this way.
+    """
+    policy = NetworkPolicy(
+        defaultAction="deny",
+        egress=[NetworkRule(action="allow", target="files.example.com")],
+    )
+    containers: list = [{"name": "sandbox", "env": [{"name": "HOME", "value": "/home/user"}]}]
+    apply_egress_to_spec(
+        containers,
+        _with_wm8_seed(_egress_settings(policy, credential_proxy_enabled=True), _WM8_SEED),
+        "sbx-1",
+    )
+    sidecar = next(c for c in containers if c["name"] == "egress")
+    sandbox = next(c for c in containers if c["name"] == "sandbox")
+
+    # The half that fails on a tree with no seeding: it must actually be delivered.
+    sidecar_env = {e["name"]: e["value"] for e in sidecar["env"]}
+    assert _WM8_SEED_ENV in sidecar_env
+    assert "s3cret-value" in sidecar_env[_WM8_SEED_ENV]
+
+    # And the half that is the security property: nowhere the sandbox can read it.
+    rendered = json.dumps(sandbox)
+    assert "s3cret-value" not in rendered
+    assert _WM8_SEED_ENV not in rendered
