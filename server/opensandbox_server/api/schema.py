@@ -20,7 +20,7 @@ for request/response validation and serialization.
 """
 
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, RootModel, model_validator
 
@@ -132,6 +132,27 @@ class CredentialProxyConfig(BaseModel):
             "When true, the server enables transparent MITM support required by "
             "Credential Vault injection. Plain egress network policy does not enable "
             "transparent MITM unless this option is set."
+        ),
+    )
+
+    seed: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "A credential-vault CreateRequest to load into the sidecar before the "
+            "sandbox starts, of the same shape POST /credential-vault accepts. Null by "
+            "default, which is the existing behaviour: the vault begins empty and is "
+            "filled over the API.\n\n"
+            "It exists because the API cannot be reached in time for anything the "
+            "sandbox does AT BOOT. A client writes the vault over the sidecar's API, "
+            "which it can only do once the sandbox exists; the server does not answer "
+            "this create call until the pod is Ready; and, where readiness gates on the "
+            "sandbox's own startup, the pod is not Ready until that startup has "
+            "finished. A mount, a proxy login, or anything else on that boot path is "
+            "then refused, and waiting there only postpones readiness and so postpones "
+            "the write by the same amount.\n\n"
+            "The seed reaches the sidecar as an environment variable of the sidecar "
+            "container, which the sandbox container cannot read -- not through the "
+            "volume the two share, where the sandbox reads the proxy CA."
         ),
     )
 

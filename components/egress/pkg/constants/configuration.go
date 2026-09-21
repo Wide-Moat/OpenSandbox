@@ -79,6 +79,31 @@ const (
 	EnvEgressMetricsExtraAttrs   = "OPENSANDBOX_EGRESS_METRICS_EXTRA_ATTRS"
 	EnvNameserverExempt          = "OPENSANDBOX_EGRESS_NAMESERVER_EXEMPT"
 	EnvCredentialVaultRequireTLS = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_REQUIRE_TLS"
+	// EnvCredentialVaultSeedFile names a file holding a credential-vault CreateRequest
+	// to load at startup, before the sandbox container can run. Empty by default, which
+	// is today's behaviour: the vault begins empty and is filled over the API.
+	//
+	// It exists because the API cannot be reached in time for anything the sandbox does
+	// AT BOOT. A client writes the vault over the sidecar's HTTP API, which it can only
+	// do once the sandbox exists; but the server does not answer the create call until
+	// the pod is Ready, and, where readiness gates on the sandbox's own
+	// startup, a pod is not Ready until that startup has finished. A mount, a proxy
+	// login, or anything else on that boot path is then refused: the credential is
+	// written seconds after the boot path needed it, and waiting there only postpones
+	// readiness, which postpones the write by the same amount. Measured on one such
+	// deployment: probe refused at 18:37:56, Ready at 18:37:58, vault written at
+	// 18:37:59.
+	EnvCredentialVaultSeedFile = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED_FILE"
+
+	// EnvCredentialVaultSeed carries the same CreateRequest inline, for a runtime with no
+	// convenient way to place a file. Empty by default.
+	//
+	// ⚠ ENV ON THE SIDECAR, NOT A SHARED VOLUME, AND THAT IS THE SECURITY PROPERTY.
+	// The sandbox and the sidecar share /opt/opensandbox -- that is where the sandbox
+	// reads the mitmproxy CA -- so a seed written there would be readable by the very
+	// code the vault exists to keep the credential away from. Containers do not share an
+	// environment, which is why the sidecar's own auth token already lives in one.
+	EnvCredentialVaultSeed = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED"
 
 	// EnvEnforcement selects WHERE egress is enforced.
 	//

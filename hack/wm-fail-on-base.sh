@@ -87,6 +87,9 @@ is_guard() {
     test_wm2_still_rejects_gvisor_with_sidecar_enforcement) return 0 ;;
     test_wm4_load_config_without_env_uses_toml_tenants_auth_token) return 0 ;;
     TestWM7StillSleepsWhenSomethingWasSignalled) return 0 ;;
+    # No seed given means no variable on the sidecar -- the unchanged default, which must
+    # hold on upstream too, where the field does not exist at all.
+    test_wm8_no_seed_is_the_default) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -224,6 +227,17 @@ for name in $(names_py test_wm2); do
 done
 for name in $(names_py test_wm4); do
   check WM-4 "$name" run_py "$name"
+done
+
+# WM-8 — the credential vault seed. The Python half runs from the same
+# test_egress_helper.py copied above; the Go half needs its own file.
+#
+# ⚠ ONLY THE BEHAVIOURAL SUBSET. The Go tests call seedCredentialVault, which upstream
+# does not have, so they cannot compile there -- a compile error proves a symbol is
+# missing, which is exactly what this script refuses to accept as a check. The Python
+# tests pass a keyword upstream's dataclass lacks, so they BUILD and fail on the answer.
+for name in $(names_py test_wm8); do
+  check WM-8 "$name" run_py "$name"
 done
 
 # WM-6 — controller. Only the behavioural half: the unit tests name the helper the

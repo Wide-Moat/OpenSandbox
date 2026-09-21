@@ -42,6 +42,9 @@ class EgressWorkloadSettings:
     # Where egress is enforced. Defaults to "sidecar", which is unchanged behaviour;
     # see EgressConfig.enforcement. Server-side only — never request-derived, unlike
     # `env` above, because a request able to set it could unfilter its own sandbox.
+    # A credential-vault CreateRequest to load before the sandbox starts. None by
+    # default, which is the existing behaviour.
+    credential_vault_seed: Optional[Dict[str, Any]] = None
     enforcement: str = EGRESS_ENFORCEMENT_SIDECAR
 
 
