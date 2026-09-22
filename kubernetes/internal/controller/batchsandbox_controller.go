@@ -81,6 +81,8 @@ type BatchSandboxReconciler struct {
 	ProfileStore        *poolassign.ProfileStore
 	taskSchedulers      sync.Map
 	StatusRVExpectation expectations.ResourceVersionExpectation
+	// SnapshotRegistry is shared with the snapshot controller for pause preflight.
+	SnapshotRegistry string
 	// ResumePullSecret is the K8s Secret name for pulling snapshot images during resume.
 	ResumePullSecret string
 }
