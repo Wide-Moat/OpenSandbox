@@ -166,6 +166,23 @@ class HTTPTenantProvider:
         except Exception as e:
             raise TenantProviderUnavailable("HTTP tenant endpoint unreachable") from e
 
+    def lookup_fresh(self, api_key: str) -> Optional[TenantEntry]:
+        """Revalidate an ongoing transport without extending a cached grant.
+
+        Share concurrent endpoint requests, but never use the TTL cache or stale
+        fallback. A denied or unavailable refresh also invalidates that cache.
+        """
+        try:
+            return self._fetch_and_cache(api_key, self._clock())
+        except _Unauthorized:
+            with self._lock:
+                self._cache.pop(api_key, None)
+            return None
+        except Exception as exc:
+            with self._lock:
+                self._cache.pop(api_key, None)
+            raise TenantProviderUnavailable("Fresh tenant authorization unavailable") from exc
+
     def list_tenants(self) -> List[TenantEntry]:
         with self._lock:
             seen = {}
