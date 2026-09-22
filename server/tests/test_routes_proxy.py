@@ -35,6 +35,14 @@ from opensandbox_server.services.constants import OPEN_SANDBOX_EGRESS_AUTH_HEADE
 from opensandbox_server.services.constants import OPEN_SANDBOX_SECURE_ACCESS_HEADER
 
 
+@pytest.fixture(autouse=True)
+def proxy_legacy_config(monkeypatch):
+    """Isolate legacy route cases from other tests that load strict global config."""
+    config = proxy_api.get_config().model_copy(deep=True)
+    config.tenants = None
+    monkeypatch.setattr(proxy_api, "get_config", lambda: config)
+
+
 class _FakeStreamingResponse:
     def __init__(
         self,
@@ -1408,3 +1416,210 @@ def test_proxy_active_credential_vault_returns_sidecar_forbidden(
     assert response.content == b"forbidden\n"
     assert fake_client.built is not None
     assert fake_client.built["url"] == "http://10.57.1.91:18080/credential-vault/_active"
+
+
+def test_legacy_open_websocket_keeps_behavior_after_provider_revocation(client, auth_headers, monkeypatch):
+    """Legacy streams keep their established behavior when strict mode is off."""
+    from starlette.websockets import WebSocketDisconnect
+    from opensandbox_server.tenants.models import TenantEntry
+    from opensandbox_server.tenants.context import get_current_tenant
+
+    class Provider:
+        revoked = False
+        calls = 0
+
+        def lookup(self, key):
+            self.calls += 1
+            return None if self.revoked else TenantEntry(name='owner', namespace='stage', subject='owner')
+
+    class Service:
+        def get_endpoint(self, *args, **kwargs):
+            assert get_current_tenant().subject == 'owner'
+            return Endpoint(endpoint='127.0.0.1:44772', headers={})
+
+    class EchoBackend(_FakeBackendWebSocket):
+        def __init__(self):
+            super().__init__(subprotocol=None)
+            self.messages = asyncio.Queue()
+
+        async def send(self, payload):
+            self.sent.append(payload)
+            await self.messages.put(payload)
+
+        async def recv(self):
+            return await self.messages.get()
+
+    provider = Provider()
+    monkeypatch.setattr(cast(Any, client.app).state, 'tenant_provider', provider, raising=False)
+    monkeypatch.setattr(lifecycle, 'sandbox_service', Service())
+    backend = EchoBackend()
+    connector = _FakeWebSocketConnector(backend)
+    monkeypatch.setattr(proxy_api.websockets, 'connect', connector)
+    path = '/v1/sandboxes/sbx-123/proxy/44772/ws'
+    with client.websocket_connect(path, headers=auth_headers) as established:
+        established.send_text('before-revocation')
+        assert established.receive_text() == 'before-revocation'
+        assert provider.calls == 1
+        provider.revoked = True
+        with client.websocket_connect(path, headers=auth_headers) as fresh:
+            with pytest.raises(WebSocketDisconnect) as denied:
+                fresh.receive_text()
+            assert denied.value.code == 1008
+        established.send_text('after-revocation')
+        assert established.receive_text() == 'after-revocation'
+        assert provider.calls == 2
+    assert len(connector.calls) == 1
+
+
+def test_strict_websocket_closes_idle_connection_after_revocation(client, auth_headers, monkeypatch):
+    from starlette.websockets import WebSocketDisconnect
+    from opensandbox_server.tenants.models import TenantEntry
+
+    class Provider:
+        revoked = False
+        fresh_calls = 0
+        def lookup(self, key):
+            return TenantEntry(name='owner', namespace='stage', subject='owner')
+        def lookup_fresh(self, key):
+            self.fresh_calls += 1
+            return None if self.revoked else self.lookup(key)
+
+    provider = Provider()
+    monkeypatch.setattr(cast(Any, client.app).state, 'tenant_provider', provider, raising=False)
+    config = proxy_api.get_config().model_copy(deep=True)
+    from opensandbox_server.config import TenantsConfig
+    config.tenants = TenantsConfig(provider="http", endpoint="http://identity.invalid", enforce_ownership=True, max_stale_seconds=0)
+    monkeypatch.setattr(proxy_api, 'get_config', lambda: config)
+    monkeypatch.setattr(proxy_api, '_PROXY_RECHECK_SECONDS', 0.01, raising=False)
+    monkeypatch.setattr(lifecycle, 'sandbox_service', SimpleNamespace(get_endpoint=lambda *a, **k: Endpoint(endpoint='127.0.0.1:44772', headers={})))
+    backend = _FakeBackendWebSocket(subprotocol=None)
+    monkeypatch.setattr(proxy_api.websockets, 'connect', _FakeWebSocketConnector(backend))
+    with client.websocket_connect('/v1/sandboxes/sbx-123/proxy/44772/ws', headers=auth_headers) as ws:
+        assert ws.receive_text() == 'backend-ready'
+        assert provider.fresh_calls >= 1
+        provider.revoked = True
+        with pytest.raises(WebSocketDisconnect) as denied:
+            ws.receive_text()
+        assert denied.value.code == 1008
+
+
+@pytest.mark.asyncio
+async def test_strict_idle_http_stream_releases_backend_on_revocation(monkeypatch):
+    from opensandbox_server.tenants.context import set_current_tenant
+    from opensandbox_server.tenants.models import TenantEntry
+    set_current_tenant(TenantEntry(name='owner', namespace='stage', subject='owner'))
+    connection = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        tenant_provider=SimpleNamespace(lookup_fresh=lambda key: None))),
+        headers={SANDBOX_API_KEY_HEADER: 'synthetic'})
+    authorization = proxy_api._ProxyAuthorization(connection)
+    monkeypatch.setattr(proxy_api, '_PROXY_RECHECK_SECONDS', 0.01)
+    backend = _BlockingStreamingResponse()
+    response = proxy_api._ProxyStreamingResponse(backend, status_code=200, headers={}, authorization=authorization)
+    async def receive():
+        await asyncio.Future()
+    async def send(message):
+        pass
+    await asyncio.wait_for(response({'type': 'http', 'asgi': {'spec_version': '2.4'}}, receive, send), timeout=1)
+    assert backend.body_started.is_set()
+    assert backend.aclose_called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('result', ['revoked', 'subject', 'namespace', 'unavailable', 'valid'])
+async def test_stream_authorization_rechecks_identity_fail_closed(monkeypatch, result):
+    from opensandbox_server.tenants.context import set_current_tenant
+    from opensandbox_server.tenants.models import TenantEntry
+    from opensandbox_server.tenants.provider import TenantProviderUnavailable
+    original = TenantEntry(name='owner', namespace='stage', subject='owner')
+    set_current_tenant(original)
+    def refresh(key):
+        if result == 'unavailable':
+            raise TenantProviderUnavailable('private upstream detail')
+        if result == 'revoked':
+            return None
+        return TenantEntry(name='rotated-name', namespace='different' if result == 'namespace' else 'stage',
+                           subject='different' if result == 'subject' else 'owner')
+    connection = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        tenant_provider=SimpleNamespace(lookup_fresh=refresh))), headers={SANDBOX_API_KEY_HEADER: 'synthetic'})
+    assert await proxy_api._ProxyAuthorization(connection).valid() is (result == 'valid')
+
+
+@pytest.mark.asyncio
+async def test_stream_authorization_timeout_is_bounded(monkeypatch):
+    import threading
+    from opensandbox_server.tenants.context import set_current_tenant
+    from opensandbox_server.tenants.models import TenantEntry
+    original = TenantEntry(name='owner', namespace='stage', subject='owner')
+    set_current_tenant(original)
+    release = threading.Event()
+    ended = threading.Event()
+    def refresh(key):
+        try:
+            release.wait(2)
+            return original
+        finally:
+            ended.set()
+    connection = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        tenant_provider=SimpleNamespace(lookup_fresh=refresh))), headers={SANDBOX_API_KEY_HEADER: 'synthetic'})
+    monkeypatch.setattr(proxy_api, '_PROXY_AUTH_TIMEOUT_SECONDS', 0.01)
+    try:
+        assert not await asyncio.wait_for(proxy_api._ProxyAuthorization(connection).valid(), timeout=0.5)
+    finally:
+        release.set()
+        await asyncio.to_thread(ended.wait, 1)
+    assert ended.is_set()
+
+
+@pytest.mark.asyncio
+async def test_strict_revocation_closes_real_loopback_backend(client, auth_headers, monkeypatch):
+    import threading
+    from websockets.asyncio.server import serve
+    from starlette.websockets import WebSocketDisconnect
+    from opensandbox_server.config import TenantsConfig
+    from opensandbox_server.tenants.models import TenantEntry
+    revoked = threading.Event()
+    closed = asyncio.Event()
+    owner = TenantEntry(name='owner', namespace='stage', subject='owner')
+    provider = SimpleNamespace(lookup=lambda key: owner, lookup_fresh=lambda key: None if revoked.is_set() else owner)
+    monkeypatch.setattr(cast(Any, client.app).state, 'tenant_provider', provider, raising=False)
+    config = proxy_api.get_config().model_copy(deep=True)
+    config.tenants = TenantsConfig(provider='http', endpoint='http://identity.invalid', enforce_ownership=True, max_stale_seconds=0)
+    monkeypatch.setattr(proxy_api, 'get_config', lambda: config)
+    monkeypatch.setattr(proxy_api, '_PROXY_RECHECK_SECONDS', 0.01)
+    async def handle(ws):
+        await ws.send('real-backend-ready')
+        await ws.wait_closed()
+        closed.set()
+    async with serve(handle, '127.0.0.1', 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setattr(lifecycle, 'sandbox_service', SimpleNamespace(
+            get_endpoint=lambda *a, **k: Endpoint(endpoint=f'127.0.0.1:{port}', headers={})))
+        def exercise():
+            with client.websocket_connect('/v1/sandboxes/sbx-123/proxy/44772/ws', headers=auth_headers) as ws:
+                assert ws.receive_text() == 'real-backend-ready'
+                revoked.set()
+                with pytest.raises(WebSocketDisconnect) as denied:
+                    ws.receive_text()
+                assert denied.value.code == 1008
+        await asyncio.wait_for(asyncio.to_thread(exercise), timeout=3)
+        await asyncio.wait_for(closed.wait(), timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_strict_http_refuses_revoked_identity_before_backend(monkeypatch):
+    from fastapi import HTTPException
+    from opensandbox_server.config import TenantsConfig
+    from opensandbox_server.tenants.context import set_current_tenant
+    from opensandbox_server.tenants.models import TenantEntry
+    set_current_tenant(TenantEntry(name='owner', namespace='stage', subject='owner'))
+    config = proxy_api.get_config().model_copy(deep=True)
+    config.tenants = TenantsConfig(provider='http', endpoint='http://identity.invalid', enforce_ownership=True, max_stale_seconds=0)
+    monkeypatch.setattr(proxy_api, 'get_config', lambda: config)
+    def unexpected(*args, **kwargs):
+        pytest.fail('revoked request reached backend resolution')
+    monkeypatch.setattr(lifecycle, 'sandbox_service', SimpleNamespace(get_endpoint=unexpected))
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        tenant_provider=SimpleNamespace(lookup_fresh=lambda key: None))), headers={SANDBOX_API_KEY_HEADER: 'synthetic'})
+    with pytest.raises(HTTPException) as rejected:
+        await proxy_api._proxy_http_request(request, 'sbx-123', 44772, 'stream')
+    assert rejected.value.status_code == 401

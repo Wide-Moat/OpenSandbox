@@ -354,3 +354,20 @@ Proxy-triggered renewal carries the authenticated tenant and subject through the
 Startup rejects strict ownership with enabled Redis renewal because the current Redis intent schema has no authenticated subject. Proxy-only renewal is supported. Do not infer identity from a sandbox ID or silently re-enable namespace-only authorization to support Redis.
 
 The default legacy profile remains unchanged. Rollback must preserve the ownership boundary: stop strict-profile ingress if an enforcing component must be rolled back, rather than expose protected resources through the legacy profile.
+
+### Ongoing proxy authorization
+
+In the authenticated ownership profile, HTTP and WebSocket proxies refresh the
+key identity before opening the backend connection and every 30 seconds while
+streaming, including idle streams. These checks bypass the provider TTL cache
+and stale fallback. A missing identity, changed subject or namespace, refresh
+failure, or a lookup exceeding 10 seconds terminates the transport. WebSocket
+clients receive policy close code 1008 when the connection can still send it.
+HTTP responses already in progress terminate; their already-sent status cannot
+be replaced with an authentication error. Clients must treat a truncated stream
+as incomplete rather than a successful command result.
+
+This closes proxy connections; it does not kill an already-started sandbox
+process, delete a sandbox, or invalidate an independent direct endpoint token.
+Platform-wide revocation and kill-switch timing remain separate acceptance
+checks on the deployed system. Legacy mode does not schedule these refreshes.
