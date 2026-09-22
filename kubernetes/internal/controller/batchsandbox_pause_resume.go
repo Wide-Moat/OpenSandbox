@@ -254,6 +254,10 @@ func (r *BatchSandboxReconciler) handlePause(ctx context.Context, bs *sandboxv1a
 		return ctrl.Result{}, nil
 	}
 
+	if r.SnapshotRegistry == "" {
+		return ctrl.Result{}, r.rejectPauseWithoutRegistry(ctx, bs)
+	}
+
 	snapshot := &sandboxv1alpha1.SandboxSnapshot{}
 	snapshotName := internalPauseSnapshotName(bs.Name)
 	err := r.Get(ctx, types.NamespacedName{Namespace: bs.Namespace, Name: snapshotName}, snapshot)
@@ -287,6 +291,30 @@ func (r *BatchSandboxReconciler) handlePause(ctx context.Context, bs *sandboxv1a
 	}
 
 	return ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+// rejectPauseWithoutRegistry records the refusal and acknowledges the request
+// atomically, without changing runtime phase or stopping tasks.
+func (r *BatchSandboxReconciler) rejectPauseWithoutRegistry(ctx context.Context, bs *sandboxv1alpha1.BatchSandbox) error {
+	var latest *sandboxv1alpha1.BatchSandbox
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest = &sandboxv1alpha1.BatchSandbox{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: bs.Namespace, Name: bs.Name}, latest); err != nil {
+			return err
+		}
+		if latest.Generation != bs.Generation {
+			return fmt.Errorf("pause request changed during registry preflight")
+		}
+		latest.Status.PauseObservedGeneration = bs.Generation
+		setConditionInStatus(&latest.Status, sandboxv1alpha1.BatchSandboxConditionPauseFailed, sandboxv1alpha1.ConditionTrue, "RegistryNotConfigured", "snapshot-registry not configured in controller manager")
+		applyBatchSandboxPhaseConditions(&latest.Status)
+		return r.Status().Update(ctx, latest)
+	}); err != nil {
+		return err
+	}
+	r.StatusRVExpectation.Expect(latest)
+	bs.Status = latest.Status
+	return nil
 }
 
 func (r *BatchSandboxReconciler) ensureInternalPauseSnapshot(ctx context.Context, bs *sandboxv1alpha1.BatchSandbox, snapshotName string) (bool, error) {
