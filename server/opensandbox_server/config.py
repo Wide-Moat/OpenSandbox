@@ -1237,6 +1237,11 @@ class StoreConfig(BaseModel):
 class TenantsConfig(BaseModel):
     """Multi-tenant provider configuration."""
 
+    enforce_ownership: bool = Field(
+        default=False,
+        description="Require an authenticated subject and enforce sandbox ownership.",
+    )
+
     provider: Literal["file", "http"] = Field(
         default="file",
         description="Tenant provider type: 'file' (tenants.toml) or 'http' (remote endpoint).",
@@ -1271,6 +1276,8 @@ class TenantsConfig(BaseModel):
 
     @model_validator(mode="after")
     def require_endpoint_for_http(self) -> "TenantsConfig":
+        if self.enforce_ownership and (self.provider != "http" or self.max_stale_seconds != 0):
+            raise ValueError("enforce_ownership requires the HTTP provider and max_stale_seconds=0.")
         if self.provider == "http" and not self.endpoint:
             raise ValueError("[tenants] endpoint must be set when provider='http'.")
         return self
@@ -1317,6 +1324,17 @@ class AppConfig(BaseModel):
     )
     @model_validator(mode="after")
     def validate_runtime_blocks(self) -> "AppConfig":
+        if self.tenants is not None and self.tenants.enforce_ownership:
+            if self.renew_intent.enabled and self.renew_intent.redis.enabled:
+                raise ValueError("enforce_ownership does not support unauthenticated Redis renewal intents; use proxy-only renewal.")
+            if (
+                self.runtime.type != "kubernetes"
+                or self.kubernetes is None
+                or self.kubernetes.workload_provider != "batchsandbox"
+            ):
+                raise ValueError(
+                    "enforce_ownership requires Kubernetes with explicit workload_provider=batchsandbox."
+                )
         if self.runtime.type == "docker":
             if self.kubernetes is not None:
                 raise ValueError("Kubernetes block must be omitted when runtime.type = 'docker'.")

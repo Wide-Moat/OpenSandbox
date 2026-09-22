@@ -110,7 +110,9 @@ class PersistedSnapshotService(SnapshotService):
         snapshot_executor=None,
         *,
         recover_unfinished_snapshots: bool = True,
+        enforce_ownership: bool = False,
     ) -> None:
+        self._enforce_ownership = enforce_ownership
         self._snapshot_repository = snapshot_repository
         self._sandbox_service = sandbox_service
         self._snapshot_runtime = snapshot_runtime or NoopSnapshotRuntime()
@@ -121,7 +123,16 @@ class PersistedSnapshotService(SnapshotService):
         if recover_unfinished_snapshots:
             self.recover_unfinished_snapshots()
 
+    def _required_owner(self) -> str | None:
+        if not self._enforce_ownership:
+            return None
+        tenant = get_current_tenant()
+        if tenant is None or not isinstance(tenant.subject, str) or not tenant.subject.strip():
+            raise HTTPException(status_code=401, detail="Authenticated subject required")
+        return tenant.subject
+
     def create_snapshot(self, sandbox_id: str, request: CreateSnapshotRequest) -> Snapshot:
+        owner_subject = self._required_owner()
         sandbox = self._sandbox_service.get_sandbox(sandbox_id)
         if sandbox_id.startswith("fsb-"):
             raise HTTPException(
@@ -170,6 +181,7 @@ class PersistedSnapshotService(SnapshotService):
             id=str(uuid4()),
             source_sandbox_id=sandbox_id,
             namespace=namespace,
+            owner_subject=owner_subject,
             name=request.name,
             restore_config=self._default_restore_config(),
             status=SnapshotStatusRecord(
@@ -186,6 +198,7 @@ class PersistedSnapshotService(SnapshotService):
         return self._to_snapshot_response(record)
 
     def list_snapshots(self, request: ListSnapshotsRequest) -> ListSnapshotsResponse:
+        owner_subject = self._required_owner()
         pagination = request.pagination or self._default_pagination()
         tenant = get_current_tenant()
         result = self._snapshot_repository.list(
@@ -196,6 +209,7 @@ class PersistedSnapshotService(SnapshotService):
                 name=request.filter.name,
                 states=request.filter.state or [],
                 namespace=tenant.namespace if tenant else None,
+                owner_subject=owner_subject,
             )
         )
 
@@ -212,6 +226,7 @@ class PersistedSnapshotService(SnapshotService):
         )
 
     def get_snapshot(self, snapshot_id: str) -> Snapshot:
+        self._required_owner()
         record = self._snapshot_repository.get(snapshot_id)
         if record is None:
             raise HTTPException(
@@ -225,6 +240,7 @@ class PersistedSnapshotService(SnapshotService):
         return self._to_snapshot_response(record)
 
     def delete_snapshot(self, snapshot_id: str) -> None:
+        self._required_owner()
         record = self._snapshot_repository.get(snapshot_id)
         if record is None:
             raise HTTPException(
@@ -278,8 +294,10 @@ class PersistedSnapshotService(SnapshotService):
         tenant = get_current_tenant()
         return tenant.namespace if tenant else None
 
-    @staticmethod
-    def _verify_tenant_access(record: SnapshotRecord) -> None:
+    def _verify_tenant_access(self, record: SnapshotRecord) -> None:
+        subject = self._required_owner()
+        if subject is not None and record.owner_subject != subject:
+            raise HTTPException(status_code=404, detail={"code": "SNAPSHOT::NOT_FOUND", "message": "Snapshot not found"})
         tenant = get_current_tenant()
         if tenant is None:
             return
@@ -298,6 +316,7 @@ class PersistedSnapshotService(SnapshotService):
             id=record.id,
             source_sandbox_id=record.source_sandbox_id,
             namespace=record.namespace,
+            owner_subject=record.owner_subject,
             name=record.name,
             description=record.description,
             restore_config=record.restore_config,
@@ -488,6 +507,7 @@ class PersistedSnapshotService(SnapshotService):
                     id=record.id,
                     source_sandbox_id=record.source_sandbox_id,
                     namespace=record.namespace,
+                    owner_subject=record.owner_subject,
                     name=record.name,
                     description=record.description,
                     restore_config=record.restore_config,
@@ -505,6 +525,7 @@ class PersistedSnapshotService(SnapshotService):
                 id=record.id,
                 source_sandbox_id=record.source_sandbox_id,
                 namespace=record.namespace,
+                owner_subject=record.owner_subject,
                 name=record.name,
                 description=record.description,
                 restore_config=SnapshotRestoreConfig(image=runtime_status.image),
@@ -523,6 +544,7 @@ class PersistedSnapshotService(SnapshotService):
                 id=record.id,
                 source_sandbox_id=record.source_sandbox_id,
                 namespace=record.namespace,
+                owner_subject=record.owner_subject,
                 name=record.name,
                 description=record.description,
                 restore_config=record.restore_config,
@@ -615,6 +637,7 @@ class PostgreSQLKubernetesSnapshotService(PersistedSnapshotService):
         *,
         recovery_interval_seconds: float,
         snapshot_executor=None,
+        enforce_ownership: bool = False,
     ) -> None:
         if recovery_interval_seconds <= 0:
             raise ValueError("recovery_interval_seconds must be greater than zero")
@@ -628,6 +651,7 @@ class PostgreSQLKubernetesSnapshotService(PersistedSnapshotService):
             snapshot_runtime=snapshot_runtime,
             snapshot_executor=snapshot_executor,
             recover_unfinished_snapshots=False,
+            enforce_ownership=enforce_ownership,
         )
         self._recovery_thread = Thread(
             target=self._run_recovery_loop,
@@ -680,6 +704,7 @@ def create_snapshot_service(sandbox_service) -> SnapshotService:
     Build the default persisted snapshot service.
     """
     active_config = get_config()
+    enforce_ownership = bool(active_config.tenants and active_config.tenants.enforce_ownership)
     snapshot_runtime: SnapshotRuntime = create_snapshot_runtime(
         active_config,
         docker_client=getattr(sandbox_service, "docker_client", None),
@@ -692,6 +717,7 @@ def create_snapshot_service(sandbox_service) -> SnapshotService:
         return PostgreSQLKubernetesSnapshotService(
             snapshot_repository=get_snapshot_repository(),
             sandbox_service=sandbox_service,
+            enforce_ownership=enforce_ownership,
             snapshot_runtime=snapshot_runtime,
             recovery_interval_seconds=(
                 active_config.store.postgresql.snapshot_recovery_interval_seconds
@@ -701,6 +727,7 @@ def create_snapshot_service(sandbox_service) -> SnapshotService:
     return PersistedSnapshotService(
         snapshot_repository=get_snapshot_repository(),
         sandbox_service=sandbox_service,
+        enforce_ownership=enforce_ownership,
         snapshot_runtime=snapshot_runtime,
     )
 

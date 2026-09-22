@@ -286,7 +286,7 @@ The server itself does not enforce resource quotas or network policies. Isolatio
 | RBAC | `RoleBinding` | Per-namespace API access |
 
 ::: info Pool APIs are not tenant-scoped
-Pool management routes (`/pools`) currently operate in the server's configured default namespace, not the authenticated tenant's namespace. Pools are shared resources. If you need per-tenant pool isolation, create separate server deployments or wait for future per-tenant pool support.
+Pool management routes (`/pools`) currently operate in the server's configured default namespace, not the authenticated tenant's namespace. Pools are shared resources; the authenticated ownership profile below denies their administration through the tenant API. In the legacy profile, if you need per-tenant pool isolation, create separate server deployments or wait for future per-tenant pool support.
 :::
 
 ## Troubleshooting
@@ -299,3 +299,58 @@ Pool management routes (`/pools`) currently operate in the server's configured d
 | 401 on valid key after config change | Hot-reload hasn't picked up change yet | Wait 2s (file) or TTL seconds (HTTP) |
 | 503 TENANT_PROVIDER_UNAVAILABLE | HTTP endpoint unreachable and cache expired past `max_stale_seconds` | Fix endpoint connectivity; increase `max_stale_seconds` |
 | Duplicate api_key error at startup | Same key assigned to multiple tenants | Ensure each key is unique across all tenants |
+
+## Authenticated ownership profile
+
+::: warning Release validation pending
+This opt-in profile has local regression coverage. Do not enable it on a shared deployment until paired-owner API tests, PostgreSQL migration checks (if applicable), pool credential and data cleanup, and revocation timing have passed against the deployed image. Enabling the flag is not evidence of isolation.
+:::
+
+```toml
+[runtime]
+type = "kubernetes"
+
+[kubernetes]
+workload_provider = "batchsandbox"
+
+[tenants]
+provider = "http"
+endpoint = "http://identity-service/tenant/identity"
+enforce_ownership = true
+max_stale_seconds = 0
+
+[renew_intent.redis]
+enabled = false
+```
+
+Merge these settings into the existing configuration, including its runtime image, namespace and identity endpoint authentication settings. The endpoint must return a nonblank opaque `subject`, a namespace, and an explicit finite nonnegative numeric `ttl`. Identity caching is capped at 300 seconds; zero disables reuse. Expired identities are never served during endpoint failure. The subject is preserved exactly, independently of namespace and API key, so key rotation need not change ownership.
+
+### Protected resources
+
+The server stamps `opensandbox.io/owner-subject` from authenticated identity. Caller metadata never grants ownership. The public `owner` label is immutable: label-safe subjects retain their representation; other subjects use the full SHA-256 digest encoded as lowercase base32 with an `h-` prefix. Authorization compares the original subject annotation, not this label.
+
+| Surface | Strict-profile behavior |
+|---|---|
+| Create | Validate identity and caller owner metadata before effects; stamp the trusted owner for cold and pool claims |
+| Read and list | Deny foreign and ownerless workloads; filter before pagination and counts |
+| Pause, resume, renewal and metadata | Check owner before mutation; reject owner transfer or removal |
+| Endpoints and diagnostics | Check owner before issuing access information or looking up pods for logs, inspect and events |
+| Delete | Authorize before workload deletion or PVC cleanup; a hidden foreign resource cannot trigger orphan cleanup |
+| PVCs | Stamp new claims; reject foreign or ownerless existing claims and conflicting create races; cleanup only matching owner annotations |
+| Snapshots | Persist owner in SQLite/PostgreSQL and through lifecycle transitions; filter before pagination; reject foreign get, delete and restore |
+
+Old workloads, PVCs and snapshots remain ownerless and inaccessible in strict mode. Database migrations add a nullable owner field and preserve it during SQLite-to-PostgreSQL transfer. Never adopt a resource based on editable metadata. Inventory existing resources and use independently attested operator migration or authorized draining before enabling the profile. Strict deletion cannot use an absent workload to authorize orphan cleanup.
+
+### Supported runtime and administration
+
+The strict profile supports the explicitly selected BatchSandbox backend. It does not compose the namespace-only FastSandbox backend and rejects `templateId` creation. Shared `/pools` and `/templates` administration returns 403, including when a template service was already cached. Operators manage shared pools through Kubernetes/GitOps; authenticated callers may claim existing pools through sandbox creation.
+
+Caller-requested host-path mounts are rejected even if a global allowlist permits them: host paths have no authenticated owner binding. Use owned PVCs or caller-authenticated object storage. Operator-supplied template mounts and underlying pool reuse remain deployment policies requiring separate review and live verification.
+
+### Renewal and rollout limits
+
+Proxy-triggered renewal carries the authenticated tenant and subject through the in-process queue without copying API keys. Processing restores the previous context after each item and rechecks resource ownership. Work older than the existing 300-second intent limit is discarded. This queue-age bound does not by itself establish a revocation SLO; cache age, queued work and long-lived connections require end-to-end measurement.
+
+Startup rejects strict ownership with enabled Redis renewal because the current Redis intent schema has no authenticated subject. Proxy-only renewal is supported. Do not infer identity from a sandbox ID or silently re-enable namespace-only authorization to support Redis.
+
+The default legacy profile remains unchanged. Rollback must preserve the ownership boundary: stop strict-profile ingress if an enforcing component must be rolled back, rather than expose protected resources through the legacy profile.

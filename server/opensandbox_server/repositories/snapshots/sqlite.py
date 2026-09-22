@@ -58,6 +58,7 @@ class SQLiteSnapshotRepository:
                     id,
                     source_sandbox_id,
                     namespace,
+                    owner_subject,
                     name,
                     description,
                     restore_config,
@@ -67,7 +68,7 @@ class SQLiteSnapshotRepository:
                     last_transition_at,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._to_db_tuple(record),
             )
@@ -81,6 +82,7 @@ class SQLiteSnapshotRepository:
                     id,
                     source_sandbox_id,
                     namespace,
+                    owner_subject,
                     name,
                     description,
                     restore_config,
@@ -100,6 +102,10 @@ class SQLiteSnapshotRepository:
     def list(self, query: SnapshotListQuery) -> SnapshotListResult:
         clauses: list[str] = []
         params: list[object] = []
+
+        if query.owner_subject is not None:
+            clauses.append("owner_subject = ?")
+            params.append(query.owner_subject)
 
         if query.namespace is not None:
             clauses.append("namespace = ?")
@@ -133,6 +139,7 @@ class SQLiteSnapshotRepository:
                     id,
                     source_sandbox_id,
                     namespace,
+                    owner_subject,
                     name,
                     description,
                     restore_config,
@@ -163,6 +170,7 @@ class SQLiteSnapshotRepository:
                 SET
                     source_sandbox_id = ?,
                     namespace = ?,
+                    owner_subject = ?,
                     name = ?,
                     description = ?,
                     restore_config = ?,
@@ -177,6 +185,7 @@ class SQLiteSnapshotRepository:
                 (
                     record.source_sandbox_id,
                     record.namespace,
+                    record.owner_subject,
                     record.name,
                     record.description,
                     json.dumps(record.restore_config.to_dict(), sort_keys=True),
@@ -203,6 +212,7 @@ class SQLiteSnapshotRepository:
                 SET
                     source_sandbox_id = ?,
                     namespace = ?,
+                    owner_subject = ?,
                     name = ?,
                     description = ?,
                     restore_config = ?,
@@ -217,6 +227,7 @@ class SQLiteSnapshotRepository:
                 (
                     record.source_sandbox_id,
                     record.namespace,
+                    record.owner_subject,
                     record.name,
                     record.description,
                     json.dumps(record.restore_config.to_dict(), sort_keys=True),
@@ -247,6 +258,7 @@ class SQLiteSnapshotRepository:
                     id TEXT PRIMARY KEY,
                     source_sandbox_id TEXT NOT NULL,
                     namespace TEXT DEFAULT NULL,
+                    owner_subject TEXT DEFAULT NULL,
                     name TEXT,
                     description TEXT,
                     restore_config TEXT NOT NULL,
@@ -269,6 +281,9 @@ class SQLiteSnapshotRepository:
                 """
             )
             self._migrate_add_namespace(conn)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}
+            if "owner_subject" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN owner_subject TEXT DEFAULT NULL")
             self._migrate_namespace_nullable(conn)
             conn.execute(
                 """
@@ -297,6 +312,7 @@ class SQLiteSnapshotRepository:
                         id TEXT PRIMARY KEY,
                         source_sandbox_id TEXT NOT NULL,
                         namespace TEXT DEFAULT NULL,
+                        owner_subject TEXT DEFAULT NULL,
                         name TEXT,
                         description TEXT,
                         restore_config TEXT NOT NULL,
@@ -308,11 +324,11 @@ class SQLiteSnapshotRepository:
                         updated_at TEXT NOT NULL
                     );
                     INSERT INTO snapshots_new (
-                        id, source_sandbox_id, namespace, name, description,
+                        id, source_sandbox_id, namespace, owner_subject, name, description,
                         restore_config, state, reason, message,
                         last_transition_at, created_at, updated_at
                     ) SELECT
-                        id, source_sandbox_id, namespace, name, description,
+                        id, source_sandbox_id, namespace, owner_subject, name, description,
                         restore_config, state, reason, message,
                         last_transition_at, created_at, updated_at
                     FROM snapshots;
@@ -340,6 +356,7 @@ class SQLiteSnapshotRepository:
             record.id,
             record.source_sandbox_id,
             record.namespace,
+            record.owner_subject,
             record.name,
             record.description,
             json.dumps(record.restore_config.to_dict(), sort_keys=True),
@@ -362,6 +379,7 @@ class SQLiteSnapshotRepository:
             id=row["id"],
             source_sandbox_id=row["source_sandbox_id"],
             namespace=row["namespace"],
+            owner_subject=row["owner_subject"],
             name=row["name"],
             description=row["description"],
             restore_config=SnapshotRestoreConfig.from_dict(restore_config),

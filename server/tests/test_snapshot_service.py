@@ -724,12 +724,14 @@ def test_postgresql_kubernetes_recovery_does_not_queue_duplicate_local_workers(
         ("postgresql", "docker", PersistedSnapshotService),
     ],
 )
+@pytest.mark.parametrize("ownership", [False, True])
 def test_snapshot_service_factory_limits_ha_to_postgresql_kubernetes(
     tmp_path,
     monkeypatch,
     store_type,
     runtime_type,
     expected_type,
+    ownership,
 ) -> None:
     repository = SQLiteSnapshotRepository(tmp_path / f"{store_type}-{runtime_type}.db")
     config = SimpleNamespace(
@@ -738,6 +740,7 @@ def test_snapshot_service_factory_limits_ha_to_postgresql_kubernetes(
             postgresql=SimpleNamespace(snapshot_recovery_interval_seconds=1),
         ),
         runtime=SimpleNamespace(type=runtime_type),
+        tenants=SimpleNamespace(enforce_ownership=ownership),
     )
     monkeypatch.setattr(snapshot_service_module, "get_config", lambda: config)
     monkeypatch.setattr(snapshot_service_module, "get_snapshot_repository", lambda: repository)
@@ -750,6 +753,12 @@ def test_snapshot_service_factory_limits_ha_to_postgresql_kubernetes(
     service = create_snapshot_service(StubSandboxService())
     try:
         assert type(service) is expected_type
+        assert isinstance(service, PersistedSnapshotService)
+        assert service._enforce_ownership is ownership
+        if ownership:
+            with pytest.raises(HTTPException) as exc:
+                service.get_snapshot("missing")
+            assert exc.value.status_code == 401
     finally:
         service.close()
         repository.close()

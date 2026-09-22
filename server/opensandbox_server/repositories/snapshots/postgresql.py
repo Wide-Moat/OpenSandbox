@@ -42,6 +42,7 @@ _SELECT_COLUMNS = """
     id,
     source_sandbox_id,
     namespace,
+    owner_subject,
     name,
     description,
     restore_config,
@@ -56,6 +57,7 @@ _SELECT_COLUMNS = """
 _UPDATE_COLUMNS = """
     source_sandbox_id = %(source_sandbox_id)s,
     namespace = %(namespace)s,
+    owner_subject = %(owner_subject)s,
     name = %(name)s,
     description = %(description)s,
     restore_config = %(restore_config)s,
@@ -106,6 +108,7 @@ class PostgreSQLSnapshotRepository:
                     id,
                     source_sandbox_id,
                     namespace,
+                    owner_subject,
                     name,
                     description,
                     restore_config,
@@ -119,6 +122,7 @@ class PostgreSQLSnapshotRepository:
                     %(id)s,
                     %(source_sandbox_id)s,
                     %(namespace)s,
+                    %(owner_subject)s,
                     %(name)s,
                     %(description)s,
                     %(restore_config)s,
@@ -146,6 +150,9 @@ class PostgreSQLSnapshotRepository:
         clauses: list[sql.SQL] = []
         params: dict[str, Any] = {}
 
+        if query.owner_subject is not None:
+            clauses.append(sql.SQL("owner_subject = %(owner_subject)s"))
+            params["owner_subject"] = query.owner_subject
         if query.namespace is not None:
             clauses.append(sql.SQL("namespace = %(namespace)s"))
             params["namespace"] = query.namespace
@@ -238,6 +245,7 @@ class PostgreSQLSnapshotRepository:
                     id TEXT PRIMARY KEY,
                     source_sandbox_id TEXT NOT NULL,
                     namespace TEXT DEFAULT NULL,
+                    owner_subject TEXT DEFAULT NULL,
                     name TEXT,
                     description TEXT,
                     restore_config JSONB NOT NULL,
@@ -250,6 +258,7 @@ class PostgreSQLSnapshotRepository:
                 )
                 """
             )
+            conn.execute("ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS owner_subject TEXT DEFAULT NULL")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_snapshots_source_sandbox_id
@@ -281,6 +290,7 @@ class PostgreSQLSnapshotRepository:
             "id": record.id,
             "source_sandbox_id": record.source_sandbox_id,
             "namespace": record.namespace,
+            "owner_subject": record.owner_subject,
             "name": record.name,
             "description": record.description,
             "restore_config": Jsonb(record.restore_config.to_dict()),
@@ -317,6 +327,7 @@ class PostgreSQLSnapshotRepository:
             id=row["id"],
             source_sandbox_id=row["source_sandbox_id"],
             namespace=row["namespace"],
+            owner_subject=row["owner_subject"],
             name=row["name"],
             description=row["description"],
             restore_config=SnapshotRestoreConfig.from_dict(restore_config),
