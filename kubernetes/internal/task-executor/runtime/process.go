@@ -239,6 +239,12 @@ trap cleanup TERM
 CHILD_PID=$!
 wait "$CHILD_PID"
 EXIT_CODE=$?
+# A trapped signal interrupts wait before the child has necessarily exited.
+# Keep the shim alive so Stop can wait for cleanup or enforce its kill deadline.
+while kill -0 "$CHILD_PID" 2>/dev/null; do
+    wait "$CHILD_PID"
+    EXIT_CODE=$?
+done
 
 printf "%%d" $EXIT_CODE > %s
 exit $EXIT_CODE

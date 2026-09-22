@@ -513,7 +513,8 @@ copy() { # <path relative to repo root>
 # Go: WM-1 in four packages and the component itself -- which the process-level tests
 # build and start, so on upstream they compile and fail on what the process does -- plus
 # WM-7's stop hook, WM-8's seed through the process and the API's wait, WM-6's flag,
-# WM-9's pause preflight, and WM-12 in execd's router.
+# WM-9's pause preflight, WM-12 in execd's router, and WM-17 in the task-executor's
+# process shim.
 copy components/egress/pkg/dnsproxy/enforcement_linux_test.go
 copy components/egress/pkg/credentialvault/enforcement_test.go
 copy components/egress/pkg/mitmproxy/regular_mode_test.go
@@ -524,6 +525,7 @@ copy components/egress/credential_vault_api_wait_test.go
 copy components/egress/cleanup_sleep_test.go
 copy kubernetes/cmd/controller/watch_namespaces_flag_test.go
 copy components/execd/pkg/web/internal_init_test.go
+copy kubernetes/internal/task-executor/runtime/process_test.go
 # WM-9's pause preflight. The test sets the registry through reflection, so on upstream,
 # where the reconciler has no such field, it compiles and fails on what pause does.
 copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
