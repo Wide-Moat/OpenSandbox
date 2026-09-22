@@ -120,7 +120,7 @@ curl http://localhost:5758/tasks/my-first-task
 
 ### 3. `DELETE /tasks/{id}` - Delete a task
 
-Marks a task for deletion. The `task-executor` will attempt to gracefully stop the task and then remove its state.
+Marks a task for deletion. The `task-executor` will attempt to gracefully stop the task and then remove its state. The process shim waits for its direct child to finish signal handling before writing the exit marker. A child that ignores termination remains subject to the existing 10-second process-group kill deadline. This is not a guarantee that independently detached descendants have been removed; sandbox deletion must still destroy the guest.
 
 *   **Method:** `DELETE`
 *   **Path:** `/tasks/{taskName}`

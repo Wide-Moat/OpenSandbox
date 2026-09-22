@@ -17,10 +17,13 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -853,4 +856,105 @@ func TestProcessExecutor_LifecycleHookTimeoutZero_NoDeadline(t *testing.T) {
 	data, err := os.ReadFile(markerFile)
 	assert.Nil(t, err)
 	assert.Contains(t, string(data), "ok")
+}
+
+// Stop must not treat an interrupted shell wait as completed task cleanup.
+func TestProcessExecutor_StopWaitsForChildCleanup(t *testing.T) {
+	executor, root := setupTestExecutor(t)
+	taskDir := filepath.Join(root, "delayed-cleanup")
+	if err := os.MkdirAll(taskDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(taskDir, "ready")
+	done := filepath.Join(taskDir, "cleanup-done")
+	cleanup := fmt.Sprintf("sleep 1; touch %s; exit 0", shellEscapePath(done))
+	script := fmt.Sprintf("trap %s TERM; touch %s; while :; do sleep 0.1; done", shellEscapePath(cleanup), shellEscapePath(ready))
+	task := &types.Task{Name: "delayed-cleanup", Process: &api.Process{Command: []string{"/bin/sh", "-c", script}}}
+	if err := executor.Start(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	// Cleanup this test's dedicated process group even when the assertion fails.
+	pidBytes, err := os.ReadFile(filepath.Join(taskDir, PidFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(pidBytes))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid pid: %q", pidBytes)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := executor.Stop(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(done); err != nil {
+		t.Fatal("Stop returned before the child completed its SIGTERM cleanup")
+	}
+}
+
+func TestProcessExecutor_StopKillsTermIgnoringChild(t *testing.T) {
+	skipIfBinaryMissing(t, "ps")
+	executor, root := setupTestExecutor(t)
+	taskDir := filepath.Join(root, "ignore-term")
+	if err := os.MkdirAll(taskDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	childFile := filepath.Join(taskDir, "child-pid")
+	script := fmt.Sprintf("trap '' TERM; echo $$ > %s; while :; do sleep 0.1; done", shellEscapePath(childFile))
+	task := &types.Task{Name: "ignore-term", Process: &api.Process{Command: []string{"/bin/sh", "-c", script}}}
+	if err := executor.Start(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	pidBytes, err := os.ReadFile(filepath.Join(taskDir, PidFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(pidBytes))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid pid: %q", pidBytes)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+	var childPID string
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if data, err := os.ReadFile(childFile); err == nil && len(data) > 0 {
+			childPID = strings.TrimSpace(string(data))
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := executor.Stop(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	// A killed orphan can remain a zombie until the host's init reaps it.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		state, err := exec.Command("ps", "-o", "stat=", "-p", childPID).Output()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(strings.TrimSpace(string(state))) == 0 {
+				break
+			}
+			t.Fatalf("could not inspect child: %v", err)
+		}
+		if strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TERM-ignoring child still runs after Stop: %s", state)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
