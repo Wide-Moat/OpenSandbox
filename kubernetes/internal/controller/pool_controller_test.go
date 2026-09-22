@@ -1661,7 +1661,9 @@ var _ = Describe("Pool recycle", func() {
 				Namespace:     typeNamespacedName.Namespace,
 				FieldSelector: fields.SelectorFromSet(fields.Set{fieldindex.IndexNameForOwnerRefUID: string(pool.UID)}),
 			})).To(Succeed())
+			originalUIDs := make(map[types.UID]struct{}, len(pods.Items))
 			for _, pod := range pods.Items {
+				originalUIDs[pod.UID] = struct{}{}
 				pod.Status.Phase = v1.PodRunning
 				pod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
 				Expect(k8sClient.Status().Update(ctx, &pod)).To(Succeed())
@@ -1713,6 +1715,13 @@ var _ = Describe("Pool recycle", func() {
 				g.Expect(allocation.PodAllocation).To(BeEmpty(), "Pool allocation should be cleared after Delete recycle")
 			}, timeout, interval).Should(Succeed())
 
+			By("verifying the used pod is actually gone, not only unallocated")
+			Eventually(func(g Gomega) {
+				usedPod := &v1.Pod{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: allocatedPodName}, usedPod)
+				g.Expect(errors.IsNotFound(err)).To(BeTrue(), "Delete recycling must remove the used pod")
+			}, timeout, interval).Should(Succeed())
+
 			By("verifying pool schedules a new pod to replenish the deleted buffer pod")
 			// The deleted pod reduces Total; the reconciler should scale up to restore BufferMin=2.
 			// envtest does not run kubelet so new pods stay Pending, but the scale-up expectation
@@ -1722,6 +1731,19 @@ var _ = Describe("Pool recycle", func() {
 				// After the deleted pod is gone and a replacement is created, Total >= 2.
 				g.Expect(pool.Status.Total).To(BeNumerically(">=", int32(2)),
 					"pool should replenish buffer after pod deletion")
+				replacements := &v1.PodList{}
+				g.Expect(k8sClient.List(ctx, replacements, &kclient.ListOptions{
+					Namespace:     pool.Namespace,
+					FieldSelector: fields.SelectorFromSet(fields.Set{fieldindex.IndexNameForOwnerRefUID: string(pool.UID)}),
+				})).To(Succeed())
+				hasNewPod := false
+				for _, pod := range replacements.Items {
+					g.Expect(pod.Name).NotTo(Equal(allocatedPodName))
+					if _, existed := originalUIDs[pod.UID]; !existed && pod.DeletionTimestamp.IsZero() {
+						hasNewPod = true
+					}
+				}
+				g.Expect(hasNewPod).To(BeTrue(), "replenishment must create a new pod UID")
 			}, 30*time.Second, interval).Should(Succeed())
 
 			Expect(k8sClient.Delete(ctx, batchSandbox)).To(Succeed())
