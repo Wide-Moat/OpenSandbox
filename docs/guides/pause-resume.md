@@ -170,6 +170,8 @@ Configure the controller manager deployment with snapshot flags:
 | `--image-committer-image` | string | `"image-committer:dev"` | Image used by commit Jobs. |
 | `--commit-job-timeout` | duration | `"10m"` | Timeout for commit Jobs. |
 
+When `--snapshot-registry` is empty, a new pause request is rejected with a `PauseFailed` condition and reason `RegistryNotConfigured` before task cleanup or snapshot creation. The sandbox remains in its current phase and its tasks remain running. Configure the registry and submit a new pause request to retry. This check does not establish that the selected runtime supports snapshots.
+
 ### Helm chart support
 
 The `opensandbox-controller` Helm chart now exposes the snapshot-related controller values directly:
