@@ -140,6 +140,18 @@ jobs:
           - name: ingress-gateway
             context: .
             dockerfile: components/ingress/Dockerfile
+          # kubernetes/Dockerfile builds whichever binary PACKAGE names, so the
+          # task-executor shares the controller's Dockerfile and differs only in
+          # its build arguments. Both values are taken from kubernetes/build.sh,
+          # which is what publish-components.yml runs upstream: USERID=0 because
+          # the task-executor runs as root inside the sandbox pod, unlike the
+          # controller's 65532.
+          - name: task-executor
+            context: kubernetes
+            dockerfile: kubernetes/Dockerfile
+            build-args: |
+              PACKAGE=cmd/task-executor/main.go
+              USERID=0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -170,9 +182,13 @@ jobs:
           push: ${{ github.ref == 'refs/heads/wm' && github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # matrix.build-args is empty for every entry that does not set it, and an
+          # empty line adds nothing, so the existing images are built exactly as
+          # before.
           build-args: |
             VERSION=${{ github.sha }}
             GIT_COMMIT=${{ github.sha }}
+            ${{ matrix.build-args }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
