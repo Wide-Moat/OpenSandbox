@@ -31,6 +31,8 @@ DEFAULT_SNAPSHOT_RESTORE_ENTRYPOINT = ["tail", "-f", "/dev/null"]
 
 async def resolve_sandbox_image_from_request(
     request: CreateSandboxRequest,
+    *,
+    required_owner: str | None = None,
 ) -> CreateSandboxRequest:
     """
     Normalize a sandbox create request to an effective image-backed request.
@@ -63,6 +65,9 @@ async def resolve_sandbox_image_from_request(
                 "message": f"Snapshot {snapshot_id} not found",
             },
         )
+
+    if required_owner is not None and snapshot.owner_subject != required_owner:
+        raise HTTPException(status_code=404, detail={"code": "SNAPSHOT::NOT_FOUND", "message": "Snapshot not found"})
 
     tenant = get_current_tenant()
     if tenant is not None and (snapshot.namespace is None or snapshot.namespace != tenant.namespace):

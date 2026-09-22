@@ -356,3 +356,13 @@ def test_migrate_snapshots_cli_cold_start(tmp_path, postgresql_dsn: str) -> None
     assert result.returncode == 0, result.stderr
     assert "Snapshots migrated: total=0, migrated=0, skipped=0" in result.stdout
     assert "partially initialized module" not in result.stdout + result.stderr
+
+
+def test_migration_reader_preserves_owner_subject(tmp_path):
+    from opensandbox_server.repositories.snapshots.migrate import _read_sqlite_snapshots_read_only
+    path = tmp_path / 'owner.db'
+    repo = SQLiteSnapshotRepository(path)
+    record = snapshot_record('owned', 'source', datetime.now(timezone.utc))
+    record.owner_subject = 'alice'
+    repo.create(record)
+    assert _read_sqlite_snapshots_read_only(path)[0]['owner_subject'] == 'alice'

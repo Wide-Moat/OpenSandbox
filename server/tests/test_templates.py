@@ -380,6 +380,7 @@ def client(service, monkeypatch):
     app = FastAPI()
     app.include_router(templates_api.router, prefix="/v1")
     monkeypatch.setattr(templates_api, "_service", service)
+    monkeypatch.setattr(templates_api, "get_config", _config)
     with TestClient(app) as test_client:
         yield test_client
 

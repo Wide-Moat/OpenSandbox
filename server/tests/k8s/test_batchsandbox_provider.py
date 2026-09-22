@@ -3388,3 +3388,16 @@ spec:
                 "subPath": "user1",
             },
         ]
+
+
+@pytest.mark.parametrize('pool', [False, True])
+def test_runtime_owner_annotation_wins_in_cold_and_pool_manifests(tmp_path, pool):
+    template = tmp_path / 'owner-template.yaml'
+    template.write_text('metadata:\n  annotations:\n    opensandbox.io/owner-subject: stale-owner\n  labels:\n    owner: stale-owner\n')
+    client = MagicMock()
+    client.create_custom_object.return_value = {'metadata': {'name': 'owned', 'uid': 'uid'}}
+    provider = BatchSandboxProvider(client, _app_config_with_template(str(template)))
+    provider.create_workload(sandbox_id='owned', namespace='shared', image_spec=ImageSpec(uri='alpine:3.20', auth=None), entrypoint=['sleep', '60'], env={}, resource_limits={'cpu': '1'}, labels={'owner': 'alice'}, annotations={'opensandbox.io/owner-subject': 'alice'}, expires_at=None, execd_image='execd:test', extensions={'poolRef': 'existing-pool'} if pool else None)
+    body = client.create_custom_object.call_args.kwargs['body']
+    assert body['metadata']['annotations']['opensandbox.io/owner-subject'] == 'alice'
+    assert body['metadata']['labels']['owner'] == 'alice'

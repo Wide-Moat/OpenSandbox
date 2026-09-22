@@ -147,8 +147,9 @@ class TestAgentSandboxServiceInit:
 
 class TestAgentSandboxServiceBuildSandbox:
 
-    def test_build_sandbox_from_workload_dict(self):
+    def test_build_sandbox_from_workload_dict(self, agent_sandbox_app_config):
         service = object.__new__(KubernetesSandboxService)
+        service.app_config = agent_sandbox_app_config
         service.namespace = "test-namespace"
         service.workload_provider = MagicMock(
             get_workload=MagicMock(),
@@ -196,8 +197,9 @@ class TestAgentSandboxServiceBuildSandbox:
         assert isinstance(sandbox.status, SandboxStatus)
         assert sandbox.status.state == "Running"
 
-    def test_build_snapshot_restored_sandbox_from_workload_dict(self):
+    def test_build_snapshot_restored_sandbox_from_workload_dict(self, agent_sandbox_app_config):
         service = object.__new__(KubernetesSandboxService)
+        service.app_config = agent_sandbox_app_config
         service.namespace = "test-namespace"
         service.workload_provider = MagicMock(
             get_workload=MagicMock(),

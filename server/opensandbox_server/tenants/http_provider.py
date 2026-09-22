@@ -43,6 +43,7 @@ Cache strategy:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -56,6 +57,12 @@ from opensandbox_server.tenants.provider import TenantProviderUnavailable
 logger = logging.getLogger(__name__)
 
 
+# A suggested TTL is advice from the endpoint, not an instruction. Capping it
+# bounds how long a revoked key keeps working if the endpoint ever answers with
+# an implausible value.
+MAX_TTL_SECONDS = 300.0
+
+
 @dataclass
 class HTTPTenantProviderConfig:
     endpoint: str
@@ -63,6 +70,10 @@ class HTTPTenantProviderConfig:
     timeout_seconds: float = 5.0
     auth_header: Optional[str] = None
     auth_token: Optional[str] = None
+    # Strict owner mode. When true the endpoint MUST name a subject, and this
+    # provider fails closed rather than producing a namespace-only entry.
+    # Default false keeps the legacy profile byte-identical.
+    require_subject: bool = False
 
 
 @dataclass
@@ -95,6 +106,9 @@ class HTTPTenantProvider:
         self._ready = False
         self._callbacks: List[Callable[[List[TenantEntry]], None]] = []
         self._client: Optional[httpx.Client] = None
+        # Injectable so cache and TTL behaviour can be asserted rather than
+        # slept for.
+        self._clock: Callable[[], float] = time.monotonic
 
     @property
     def supports_enumeration(self) -> bool:
@@ -102,14 +116,15 @@ class HTTPTenantProvider:
         return False
 
     def lookup(self, api_key: str) -> Optional[TenantEntry]:
-        now = time.monotonic()
+        now = self._clock()
 
         with self._lock:
             cached = self._cache.get(api_key)
 
         if cached is not None:
             age = now - cached.fetched_at
-            if age <= cached.ttl:
+            # A zero TTL means exactly that: no reuse, however fresh the entry.
+            if (age < cached.ttl if self._config.require_subject else age <= cached.ttl):
                 return cached.tenant
 
             # TTL expired — sync refresh
@@ -120,6 +135,19 @@ class HTTPTenantProvider:
                     self._cache.pop(api_key, None)
                 return None
             except Exception:
+                # ⚠ STRICT MODE NEVER SERVES STALE. max_stale_seconds exists to
+                # ride out an outage on namespace-only tenancy; reusing an old
+                # entry here would keep asserting an owner the endpoint can no
+                # longer confirm, which is the revocation window this mode is
+                # meant to close. Fail closed instead, regardless of the
+                # configured stale window.
+                if self._config.require_subject:
+                    with self._lock:
+                        self._cache.pop(api_key, None)
+                    raise TenantProviderUnavailable(
+                        "HTTP tenant endpoint unreachable and strict owner mode "
+                        "refuses to serve a stale identity"
+                    )
                 if age > cached.ttl + self._config.max_stale_seconds:
                     raise TenantProviderUnavailable(
                         f"HTTP tenant endpoint unreachable and cache stale "
@@ -133,8 +161,10 @@ class HTTPTenantProvider:
             return self._fetch_and_cache(api_key, now)
         except _Unauthorized:
             return None
+        except TenantProviderUnavailable:
+            raise
         except Exception as e:
-            raise TenantProviderUnavailable(f"HTTP tenant endpoint unreachable: {e}") from e
+            raise TenantProviderUnavailable("HTTP tenant endpoint unreachable") from e
 
     def list_tenants(self) -> List[TenantEntry]:
         with self._lock:
@@ -184,17 +214,32 @@ class HTTPTenantProvider:
                 is_leader = True
 
         if not is_leader:
-            flight.wait(timeout=self._config.timeout_seconds)
+            # ⚠ THE WAIT RESULT IS THE CONTRACT. The previous version discarded
+            # it and read the cache, so a follower whose wait TIMED OUT could
+            # return the very stale entry the leader was refreshing. A timeout
+            # means we do not know the answer, which is unavailable, not a hit.
+            completed = flight.wait(timeout=self._config.timeout_seconds)
+            if not completed:
+                raise TenantProviderUnavailable(
+                    "Timed out waiting for in-flight tenant lookup"
+                )
             if flight.error is not None:
                 raise flight.error
+            # The leader finished successfully: share its result directly rather
+            # than re-reading the cache, so a ttl=0 fetch (which is not cached
+            # for reuse) still serves its own followers.
+            if flight.result is not None:
+                return flight.result
             with self._lock:
                 cached = self._cache.get(api_key)
-            if cached:
+            if cached is not None and cached.ttl > 0:
                 return cached.tenant
-            raise TenantProviderUnavailable("Timed out waiting for in-flight tenant lookup")
+            raise TenantProviderUnavailable("In-flight tenant lookup produced no result")
 
         try:
-            return self._do_fetch(api_key, now)
+            result = self._do_fetch(api_key, now)
+            flight.result = result
+            return result
         except Exception as e:
             flight.error = e
             raise
@@ -218,22 +263,75 @@ class HTTPTenantProvider:
 
         resp.raise_for_status()
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise TenantProviderUnavailable(
+                "HTTP tenant endpoint returned a body that is not JSON"
+            ) from exc
+        if not isinstance(data, dict):
+            raise TenantProviderUnavailable(
+                "HTTP tenant endpoint returned an unexpected document"
+            )
+
         namespace = (data.get("namespace") or "").strip()
         if not namespace:
             raise ValueError("HTTP tenant endpoint returned empty namespace for key")
-        ttl = float(data.get("ttl", 30))
+
+        ttl = (_coerce_ttl(data.get("ttl")) if self._config.require_subject else float(data.get("ttl", 30)))
+        subject = _coerce_subject(data.get("subject"), self._config.require_subject)
 
         entry = TenantEntry(
             name=namespace,
             namespace=namespace,
             api_keys=(api_key,),
+            subject=subject,
         )
 
         with self._lock:
             self._cache[api_key] = _CacheEntry(tenant=entry, fetched_at=now, ttl=ttl)
 
         return entry
+
+
+def _coerce_ttl(raw: object) -> float:
+    """Validate a suggested TTL.
+
+    ⚠ `bool` IS AN `int` IN PYTHON, so `True` would otherwise become a 1-second
+    TTL and `False` a zero one. A boolean is not a duration; it is a malformed
+    answer and is refused.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise TenantProviderUnavailable("HTTP tenant endpoint returned a non-numeric ttl")
+    value = float(raw)
+    if math.isnan(value) or math.isinf(value):
+        raise TenantProviderUnavailable("HTTP tenant endpoint returned a non-finite ttl")
+    if value < 0:
+        raise TenantProviderUnavailable("HTTP tenant endpoint returned a negative ttl")
+    return min(value, MAX_TTL_SECONDS)
+
+
+def _coerce_subject(raw: object, required: bool) -> Optional[str]:
+    """Validate the authenticated subject.
+
+    Returned exactly as received when usable: the value is opaque, and
+    normalising it here would make this service the author of an identity it
+    only carries.
+    """
+    if raw is None:
+        if required:
+            raise TenantProviderUnavailable(
+                "strict owner mode requires a subject and the endpoint named none"
+            )
+        return None
+    # A bool is an int, not a name.
+    if isinstance(raw, bool) or not isinstance(raw, str):
+        raise TenantProviderUnavailable(
+            "HTTP tenant endpoint returned a subject that is not a string"
+        )
+    if not raw.strip():
+        raise TenantProviderUnavailable("HTTP tenant endpoint returned a blank subject")
+    return raw
 
 
 class _Unauthorized(Exception):

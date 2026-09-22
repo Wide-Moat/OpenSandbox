@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
 from typing import TYPE_CHECKING, Optional
@@ -46,6 +46,8 @@ from opensandbox_server.integrations.renew_intent.redis_client import connect_re
 from opensandbox_server.services.extension_service import ExtensionService, require_extension_service
 from opensandbox_server.services.factory import create_sandbox_service
 from opensandbox_server.services.sandbox_service import SandboxService
+from opensandbox_server.tenants.context import get_current_tenant, set_current_tenant
+from opensandbox_server.tenants.models import TenantEntry
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -60,6 +62,7 @@ class RenewWorkItem:
     source: str
     sandbox_id: str
     observed_at: datetime
+    tenant: TenantEntry | None = None
 
 
 @dataclass
@@ -161,11 +164,13 @@ class RenewIntentConsumer:
         )
 
     async def _enqueue_proxy(self, sandbox_id: str) -> None:
+        tenant = get_current_tenant()
         await self._work_queue.put(
             RenewWorkItem(
                 source=RENEW_SOURCE_SERVER_PROXY,
                 sandbox_id=sandbox_id,
                 observed_at=datetime.now(timezone.utc),
+                tenant=replace(tenant, api_keys=()) if tenant is not None else None,
             )
         )
 
@@ -285,6 +290,16 @@ class RenewIntentConsumer:
                 self._work_queue.task_done()
 
     async def _process_work(self, work: RenewWorkItem) -> None:
+        previous = get_current_tenant()
+        set_current_tenant(work.tenant)
+        try:
+            await self._process_scoped_work(work)
+        finally:
+            set_current_tenant(previous)
+
+    async def _process_scoped_work(self, work: RenewWorkItem) -> None:
+        if self._is_stale(work.observed_at):
+            return
         if self._redis is None and work.source != RENEW_SOURCE_SERVER_PROXY:
             return
 

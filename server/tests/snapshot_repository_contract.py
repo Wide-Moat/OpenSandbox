@@ -182,3 +182,20 @@ class SnapshotRepositoryContract:
         repository.delete(original.id)
         repository.delete(original.id)
         assert repository.get(original.id) is None
+
+    def test_owner_filter_precedes_pagination_and_survives_updates(self, repository):
+        for ident, owner in [('owned', 'alice'), ('foreign', 'bob'), ('legacy', None)]:
+            record = snapshot_record(ident, 'source', datetime.now(timezone.utc), namespace='shared')
+            record.owner_subject = owner
+            repository.create(record)
+        record = repository.get('owned')
+        assert record.owner_subject == 'alice'
+        record.name = 'renamed'
+        repository.update(record)
+        record.status.state = SnapshotState.READY
+        assert repository.update_if_state(record, SnapshotState.CREATING)
+        page = repository.list(SnapshotListQuery(namespace='shared', owner_subject='alice', page_size=1))
+        assert page.total_items == 1
+        assert [item.id for item in page.items] == ['owned']
+        assert page.items[0].owner_subject == 'alice'
+        assert repository.get('legacy').owner_subject is None
