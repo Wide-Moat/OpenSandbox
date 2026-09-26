@@ -96,6 +96,12 @@ func startPolicyServer(
 	handler.credentialVault = credentialvault.NewStore(mitmGate, func() bool { return strings.TrimSpace(token) != "" })
 	handler.credentialVaultRequireTLS = constants.IsTruthy(os.Getenv(constants.EnvCredentialVaultRequireTLS))
 	handler.setAlwaysRules(alwaysDeny, alwaysAllow)
+	// ⚠ AFTER setAlwaysRules, NOT BEFORE. The seed is validated against
+	// effectivePolicy, which merges the always-allow/always-deny overlay; seeding first
+	// would judge it against the user policy alone and refuse a binding whose
+	// destination the overlay permits -- the same request would then succeed over the
+	// API, which is the kind of difference nobody thinks to look for.
+	handler.seedCredentialVault(os.Getenv(constants.EnvCredentialVaultSeed))
 
 	mux.HandleFunc("/policy", handler.handlePolicy)
 	mux.HandleFunc("/credential-vault", handler.handleCredentialVault)
@@ -219,15 +225,79 @@ func (s *policyServer) handlePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// seedCredentialVault fills the vault before the first request (WM-8), from the
+// CreateRequest in OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED.
+//
+// ⚠ IT NEVER FAILS THE SIDECAR. A seed that does not parse or is refused leaves the
+// vault as it was -- not created, fillable over the API -- because the sandbox this
+// sidecar guards must still start. The failure is logged and nothing else.
+//
+// ⚠ AND IT IS NOT A SECOND WAY IN. It goes through what POST /credential-vault goes
+// through -- the revision-runtime refusal, the same decoder, the same preconditions, the
+// same create against the same effective policy -- with one step left out: the wait for
+// mitmdump, which starts only after this server does, so waiting would deadlock startup.
+// If the vault already exists the seed is skipped rather than merged.
+func (s *policyServer) seedCredentialVault(seed string) {
+	seed = strings.TrimSpace(seed)
+	if seed == "" {
+		// Unset: no seeding, today's behaviour.
+		return
+	}
+	const source = constants.EnvCredentialVaultSeed
+	if err := credentialVaultWritesRefused(); err != nil {
+		log.Warnf("credential vault seed: %s refused (%v); the vault starts empty", source, err)
+		return
+	}
+	var req credentialvault.CreateRequest
+	if err := credentialvault.DecodeJSON(strings.NewReader(seed), &req); err != nil {
+		log.Warnf("credential vault seed: %s is not a CreateRequest (%v); the vault starts empty", source, err)
+		return
+	}
+	// Stricter than the API, deliberately: an empty request would create an empty vault,
+	// and the client's own POST would then get 409 for a vault nobody filled.
+	if len(req.Credentials) == 0 && len(req.Bindings) == 0 {
+		log.Warnf("credential vault seed: %s names no credential and no binding; the vault starts empty", source)
+		return
+	}
+	if err := s.credentialVault.Preconditions(); err != nil {
+		log.Warnf("credential vault seed: %s refused (%v); the vault starts empty", source, err)
+		return
+	}
+	if _, err := s.createCredentialVault(req); err != nil {
+		log.Warnf("credential vault seed: %s was refused (%v); the vault starts empty", source, err)
+		return
+	}
+	log.Infof("credential vault seed: %d credential(s) and %d binding(s) loaded from %s before the first request",
+		len(req.Credentials), len(req.Bindings), source)
+}
+
+// createCredentialVault creates the vault against the effective policy, which merges the
+// always-allow/always-deny overlay. The API's POST and the startup seed both call it.
+func (s *policyServer) createCredentialVault(req credentialvault.CreateRequest) (credentialvault.State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.credentialVault.Create(req, s.effectivePolicy())
+}
+
+// credentialVaultWritesRefused is upstream's refusal of vault writes under the
+// experimental revision runtime, shared by the API and the startup seed.
+func credentialVaultWritesRefused() error {
+	if constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime)) {
+		return errors.New("credential vault writes are unavailable while the experimental revision runtime is enabled")
+	}
+	return nil
+}
+
 func (s *policyServer) handleCredentialVault(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime)) &&
-		(r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodDelete) {
-		http.Error(w, "credential vault writes are unavailable while the experimental revision runtime is enabled", http.StatusServiceUnavailable)
-		return
+	if r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodDelete {
+		if err := credentialVaultWritesRefused(); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 	}
 	switch r.Method {
 	case http.MethodGet:
@@ -319,11 +389,7 @@ func (s *policyServer) handleCredentialVaultPost(w http.ResponseWriter, r *http.
 		http.Error(w, fmt.Sprintf("invalid credential vault request: %v", err), http.StatusBadRequest)
 		return
 	}
-	state, err := func() (credentialvault.State, error) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return s.credentialVault.Create(req, s.effectivePolicy())
-	}()
+	state, err := s.createCredentialVault(req)
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return

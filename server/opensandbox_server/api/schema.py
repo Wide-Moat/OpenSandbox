@@ -20,9 +20,9 @@ for request/response validation and serialization.
 """
 
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, PrivateAttr, RootModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, RootModel, model_validator
 
 from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
 
@@ -121,6 +121,28 @@ class NetworkPolicy(BaseModel):
         populate_by_name = True
 
 
+class CredentialVaultSeed(BaseModel):
+    """
+    The credential vault a sandbox starts with: the body of the egress sidecar's
+    ``POST /credential-vault``, ``CredentialVaultCreateRequest`` in
+    specs/egress-api.yaml.
+
+    Checked here for its outer shape -- both lists present, nothing else beside them --
+    so a misspelt key is refused by the create call instead of by a sidecar log line
+    after the sandbox has started without its credential. The entries themselves are
+    judged by the sidecar, with the decoder its own API uses.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    credentials: List[Dict[str, Any]] = Field(
+        ..., description="Credentials, as CredentialVaultCreateRequest.credentials."
+    )
+    bindings: List[Dict[str, Any]] = Field(
+        ..., description="Bindings, as CredentialVaultCreateRequest.bindings."
+    )
+
+
 class CredentialProxyConfig(BaseModel):
     """
     Credential proxy startup options.
@@ -132,6 +154,18 @@ class CredentialProxyConfig(BaseModel):
             "When true, the server enables transparent MITM support required by "
             "Credential Vault injection. Plain egress network policy does not enable "
             "transparent MITM unless this option is set."
+        ),
+    )
+
+    seed: Optional[CredentialVaultSeed] = Field(
+        None,
+        description=(
+            "A credential vault to load into the egress sidecar before the sandbox "
+            "starts. Requires enabled and a networkPolicy, and cannot be combined with "
+            "poolRef. Null by default: the vault begins empty and is filled over the "
+            "API, which can only happen after this create call has returned -- too "
+            "late for a credential the sandbox needs while it boots. Delivered in the "
+            "egress sidecar's environment only; the sandbox container cannot read it."
         ),
     )
 
@@ -612,7 +646,14 @@ class CreateSandboxRequest(BaseModel):
         # When poolRef is set, image/snapshotId/entrypoint/resourceLimits are
         # all defined in the Pool CRD and not required from the caller.
         has_pool_ref = bool((self.extensions or {}).get("poolRef", "").strip())
+        # WM-8. A seed is loaded by the egress sidecar of a sandbox with a networkPolicy
+        # and transparent MITM, and nowhere else: without those there is no sidecar, or
+        # one that refuses it, and the sandbox would start without the credential the
+        # caller asked for -- answered 201, with the reason only in a sidecar log line.
+        has_seed = self.credential_proxy is not None and self.credential_proxy.seed is not None
         if has_pool_ref:
+            if has_seed:
+                raise ValueError("credentialProxy.seed cannot be used together with poolRef.")
             if self.lifecycle is not None:
                 raise ValueError("lifecycle cannot be used together with poolRef.")
             # Reject conflicting fields that would be ignored in pool mode
@@ -627,6 +668,8 @@ class CreateSandboxRequest(BaseModel):
         if self.credential_proxy and self.credential_proxy.enabled:
             if self.network_policy is None:
                 raise ValueError("credentialProxy.enabled requires networkPolicy.")
+        elif has_seed:
+            raise ValueError("credentialProxy.seed requires credentialProxy.enabled.")
 
         has_image = self.image is not None and bool(self.image.uri.strip())
         has_snapshot = bool((self.snapshot_id or "").strip())

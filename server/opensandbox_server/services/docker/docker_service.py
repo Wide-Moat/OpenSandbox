@@ -107,6 +107,7 @@ from opensandbox_server.services.endpoint_auth import (
     generate_egress_token,
 )
 from opensandbox_server.services.helpers import (
+    credential_vault_seed,
     matches_filter,
     parse_timestamp,
     split_egress_env,
@@ -833,6 +834,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     runtime_volume_name=runtime_volume_name,
                     credential_proxy_enabled=credential_proxy_enabled,
                     extra_env=egress_env or None,
+                    credential_vault_seed=credential_vault_seed(request),
                 )
                 labels[SANDBOX_EMBEDDING_PROXY_PORT_LABEL] = str(host_execd_port)
                 labels[SANDBOX_HTTP_PORT_LABEL] = str(host_http_port)

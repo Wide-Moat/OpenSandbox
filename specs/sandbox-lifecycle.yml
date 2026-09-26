@@ -2059,6 +2059,36 @@ components:
             `[egress].mode = "dns+nft"` unless `[egress] enforcement` is
             `external`. `defaultAction: deny` is strongly recommended;
             default-allow support is deprecated.
+        seed:
+          $ref: '#/components/schemas/CredentialVaultSeed'
+      additionalProperties: false
+
+    CredentialVaultSeed:
+      type: object
+      description: |
+        A credential vault to load into the egress sidecar before the sandbox
+        starts, for a credential the sandbox needs while it boots: the
+        credential vault API can only be written after the create call has
+        returned. The body of the egress sidecar's `POST /credential-vault`,
+        `CredentialVaultCreateRequest` in `specs/egress-api.yaml`, which defines
+        the entries; the server checks the outer shape and the sidecar the
+        entries. Requires `credentialProxy.enabled` and `networkPolicy`, and
+        cannot be combined with `extensions.poolRef`. Delivered in the egress
+        sidecar's environment only; the sandbox container cannot read it.
+      required: [credentials, bindings]
+      properties:
+        credentials:
+          type: array
+          description: As `CredentialVaultCreateRequest.credentials`.
+          items:
+            type: object
+            additionalProperties: true
+        bindings:
+          type: array
+          description: As `CredentialVaultCreateRequest.bindings`.
+          items:
+            type: object
+            additionalProperties: true
       additionalProperties: false
 
     NetworkRule:

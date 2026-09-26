@@ -58,6 +58,7 @@ from opensandbox_server.services.endpoint_auth import (
     merge_endpoint_headers,
 )
 from opensandbox_server.services.helpers import (
+    credential_vault_seed_egress_env,
     egress_enforcement,
     upstream_proxy_egress_env,
 )
@@ -485,6 +486,7 @@ class DockerNetworkingMixin:
         runtime_volume_name: Optional[str] = None,
         credential_proxy_enabled: bool = False,
         extra_env: Optional[Dict[str, Optional[str]]] = None,
+        credential_vault_seed: Optional[Dict[str, Any]] = None,
     ):
         sidecar_name = f"sandbox-egress-{sandbox_id}"
         sidecar_labels = {
@@ -518,6 +520,8 @@ class DockerNetworkingMixin:
             sidecar_env.append(f"{key}={value}")
         if credential_proxy_enabled:
             sidecar_env.append(f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=true")
+        for key, value in credential_vault_seed_egress_env(credential_vault_seed).items():
+            sidecar_env.append(f"{key}={value}")
 
         if extra_env:
             skip_keys = (

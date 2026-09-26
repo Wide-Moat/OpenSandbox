@@ -79,6 +79,18 @@ const (
 	EnvEgressMetricsExtraAttrs   = "OPENSANDBOX_EGRESS_METRICS_EXTRA_ATTRS"
 	EnvNameserverExempt          = "OPENSANDBOX_EGRESS_NAMESERVER_EXEMPT"
 	EnvCredentialVaultRequireTLS = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_REQUIRE_TLS"
+	// EnvCredentialVaultSeed carries a credential-vault CreateRequest to load at
+	// startup, before the sandbox container can run, so a credential the sandbox needs
+	// on its boot path is there in time. Empty by default, which is today's behaviour:
+	// the vault begins empty and is filled over the API. Why the API cannot serve that
+	// case: NOTICE-WIDE-MOAT.md, WM-8.
+	//
+	// ⚠ In the sidecar container's own environment, and only there. Not a file: the
+	// one volume the sidecar shares with the sandbox is where the sandbox reads the
+	// proxy CA, so a seed placed there would be readable by the code the vault exists
+	// to keep the credential from.
+	EnvCredentialVaultSeed = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED"
+
 	// EnvEnforcement selects WHERE egress is enforced.
 	//
 	// EnforcementSidecar (the default, and the behaviour when unset) is the
