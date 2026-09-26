@@ -409,6 +409,8 @@ func TestTaskManager_GetEmptyName(t *testing.T) {
 func TestTaskManager_List(t *testing.T) {
 	mgr, _ := setupTestManager(t)
 	ctx := context.Background()
+	mgr.Start(ctx)
+	defer mgr.Stop()
 
 	// Initially empty
 	tasks, err := mgr.List(ctx)
@@ -431,7 +433,7 @@ func TestTaskManager_List(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
-	defer mgr.Delete(ctx, task.Name)
+	defer cleanupTask(t, mgr, task.Name)
 
 	// List should return 1 task
 	tasks, err = mgr.List(ctx)
