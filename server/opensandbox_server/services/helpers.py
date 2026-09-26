@@ -21,17 +21,19 @@ so multiple container runtimes (docker, kubernetes, etc.) can reuse them.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from opensandbox_server.api.schema import Endpoint, Sandbox, SandboxFilter
 from opensandbox_server.services.constants import (
     ALLOWED_EGRESS_ENV_VARS,
     EGRESS_ENV_PREFIX,
     EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED,
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA,
@@ -314,6 +316,31 @@ def upstream_proxy_egress_env(
     return env
 
 
+def credential_vault_seed(request: Any) -> Optional[Dict[str, Any]]:
+    """``credentialProxy.seed`` of a create request as the JSON object the egress sidecar
+    decodes, or None when the request carries none."""
+    credential_proxy = getattr(request, "credential_proxy", None)
+    if credential_proxy is None or credential_proxy.seed is None:
+        return None
+    # mode="json": the value is rendered with json.dumps, which a model_dump of anything
+    # but plain JSON types would make raise.
+    return credential_proxy.seed.model_dump(mode="json")
+
+
+def credential_vault_seed_egress_env(
+    seed: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Env entries injected into the egress sidecar for ``credentialProxy.seed``.
+    Empty when the request carries no seed.
+
+    Sidecar env only, on every runtime (see NOTICE-WIDE-MOAT.md, WM-8): the sandbox
+    container must never see the credential.
+    """
+    if seed is None:
+        return {}
+    return {OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED: json.dumps(seed)}
+
+
 def egress_enforcement(egress_config: Optional[EgressConfig]) -> str:
     """Where egress is enforced for this configuration: ``[egress] enforcement``, or
     ``"sidecar"`` when there is no ``[egress]`` block."""
@@ -369,6 +396,8 @@ __all__ = [
     "matches_filter",
     "split_egress_env",
     "upstream_proxy_egress_env",
+    "credential_vault_seed",
+    "credential_vault_seed_egress_env",
     "egress_enforcement",
     "validate_upstream_proxy_request",
 ]

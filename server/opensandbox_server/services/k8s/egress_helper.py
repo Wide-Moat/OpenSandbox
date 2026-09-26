@@ -38,7 +38,10 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
 )
-from opensandbox_server.services.helpers import upstream_proxy_egress_env
+from opensandbox_server.services.helpers import (
+    credential_vault_seed_egress_env,
+    upstream_proxy_egress_env,
+)
 from opensandbox_server.config import EGRESS_ENFORCEMENT_EXTERNAL
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 
@@ -144,6 +147,10 @@ def apply_egress_to_spec(
                 },
             }
         )
+    for name, value in credential_vault_seed_egress_env(
+        egress_settings.credential_vault_seed
+    ).items():
+        env.append({"name": name, "value": value})
     if egress_settings.env:
         for name, value in egress_settings.env.items():
             if (
