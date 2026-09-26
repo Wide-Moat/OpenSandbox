@@ -109,6 +109,13 @@ def apply_windows_profile_overrides(
     else:
         main_container.pop("command", None)
     main_container.pop("args", None)
+    # WM-10's execd probes do not apply here. execd.exe runs inside the Windows guest,
+    # which answers only once Windows has booted -- or installed, minutes later -- while
+    # the server's create call gives up after 60 s by default and deletes the sandbox.
+    # This profile has always been Ready when QEMU runs, and callers wait for the guest
+    # with the SDK's ready_timeout (docs/guides/windows-sandbox.md).
+    main_container.pop("startupProbe", None)
+    main_container.pop("readinessProbe", None)
     main_container["env"] = windows_env if windows_env else None
     # Memory includes overhead for the QEMU process itself.
     if resource_limits:
