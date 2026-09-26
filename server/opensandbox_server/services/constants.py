@@ -25,6 +25,15 @@ SANDBOX_MANUAL_CLEANUP_LABEL = "opensandbox.io/manual-cleanup"
 SANDBOX_PLATFORM_OS_LABEL = "opensandbox.io/platform-os"
 SANDBOX_PLATFORM_ARCH_LABEL = "opensandbox.io/platform-arch"
 SANDBOX_SNAPSHOT_ID_LABEL = "opensandbox.io/snapshot-id"
+# The port execd listens on inside every sandbox. Its owner is execd itself
+# (components/execd), not this server. Named here for the fork's two readers, the
+# readiness probe (WM-10) and the proxy's /internal/ refusal (WM-11). Upstream's own
+# "44772" literals -- the Docker port mappings in docker/docker_service.py and
+# docker/networking.py, the Windows profile's default ports -- are deliberately left as
+# they are: rewriting upstream lines the fork does not otherwise touch costs a conflict
+# on every rebase and changes nothing, since all of them are the same number. Replacing
+# them belongs in a change sent upstream, not in the fork.
+EXECD_PORT = 44772
 # Host-mapped ports recorded on containers (bridge mode).
 SANDBOX_EMBEDDING_PROXY_PORT_LABEL = (
     "opensandbox.io/embedding-proxy-port"  # maps container 44772 -> host port
@@ -188,6 +197,7 @@ class SnapshotErrorCodes:
 
 
 __all__ = [
+    "EXECD_PORT",
     "RESERVED_LABEL_PREFIX",
     "SANDBOX_ID_LABEL",
     "SANDBOX_TENANT_LABEL",
