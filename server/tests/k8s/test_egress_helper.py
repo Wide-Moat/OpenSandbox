@@ -316,6 +316,51 @@ class TestEgressSidecarViaApply:
         assert security_context.get("privileged") is not True
         assert "NET_ADMIN" in security_context.get("capabilities", {}).get("add", [])
 
+    def test_wm2_external_enforcement_drops_net_admin_and_passes_the_variable(self):
+        """Enforcing outside the pod, the sidecar needs no capability and must be told so.
+
+        NET_ADMIN exists so the sidecar can install redirects. It installs none in this
+        mode, and under a sandboxed kernel the capability cannot be granted at all — an
+        admission policy forbidding added capabilities rejects the pod, and the failure
+        reaches the client as a timeout with the reason only in namespace events.
+
+        Built with dataclasses.replace and the field named by string, so this compiles
+        against a tree without the field and fails on the MANIFEST rather than on a
+        missing attribute.
+        """
+        import dataclasses
+
+        network_policy = NetworkPolicy(default_action="deny", egress=[])
+        settings = _egress_settings(network_policy, "opensandbox/egress:v1.1.7")
+        # replace() only where the field exists, so this runs on a tree without it and
+        # fails on the MANIFEST rather than on a TypeError from the constructor.
+        if any(f.name == "enforcement" for f in dataclasses.fields(settings)):
+            settings = dataclasses.replace(settings, enforcement="external")
+
+        containers: list = []
+        apply_egress_to_spec(containers, settings)
+        container = containers[0]
+
+        assert "NET_ADMIN" not in container.get("securityContext", {}).get(
+            "capabilities", {}
+        ).get("add", []), "external enforcement must add no capabilities"
+
+        env = {e["name"]: e["value"] for e in container["env"]}
+        assert env.get("OPENSANDBOX_EGRESS_ENFORCEMENT") == "external", (
+            "the sidecar must be told where enforcement lives, or it installs redirects "
+            "and crash-loops on the netfilter it cannot reach"
+        )
+
+    def test_wm2_the_enforcement_variable_is_not_request_settable(self):
+        """A request must not be able to choose where enforcement lives.
+
+        It is a property of the cluster. A sandbox able to set it could tell its own
+        sidecar to install nothing, which is unfiltering itself.
+        """
+        from opensandbox_server.services.constants import ALLOWED_EGRESS_ENV_VARS
+
+        assert "OPENSANDBOX_EGRESS_ENFORCEMENT" not in ALLOWED_EGRESS_ENV_VARS
+
     def test_no_command_uses_image_entrypoint(self):
         container = _egress_container(
             "opensandbox/egress:v1.1.7",

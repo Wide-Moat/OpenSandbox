@@ -135,6 +135,197 @@ def test_load_config_env_api_key_without_toml_key(tmp_path, monkeypatch):
     assert loaded.server.api_key == "env-only-key"
 
 
+def test_wm2_egress_enforcement_defaults_to_sidecar(tmp_path, monkeypatch):
+    """An unset key must mean today's behaviour, or upgrading changes a running cluster."""
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        mode = "dns"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    # getattr with the default spelled out: on a tree without the field the answer is
+    # the same "sidecar", which is correct -- that IS the behaviour when unset. This
+    # test is the guard on the default, and it is meant to pass on both trees.
+    assert getattr(loaded.egress, "enforcement", "sidecar") == "sidecar"
+
+
+def test_wm2_load_config_accepts_enforcement_external(tmp_path, monkeypatch):
+    """[egress] enforcement = "external" must be accepted and carried through."""
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        mode = "dns"
+        enforcement = "external"
+        disable_ipv6 = false
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    # No getattr default here: an unmodified tree parses the key, ignores it, and this
+    # must fail -- an accepted-but-ignored setting is the failure mode being fixed.
+    assert getattr(loaded.egress, "enforcement", "sidecar") == "external", (
+        "[egress] enforcement was accepted but not applied"
+    )
+
+
+def test_wm2_load_config_rejects_an_unknown_enforcement(tmp_path, monkeypatch):
+    """A typo must be refused, not read as the default.
+
+    Falling back would put a deployment configured for a sandboxed kernel back on the
+    path that cannot work there, and the only symptom would be a crash-loop whose
+    message is about netlink -- naming neither the key nor the misspelling.
+    """
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        enforcement = "externl"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    with pytest.raises(ValidationError):
+        config_module.load_config(config_path)
+
+
+def test_wm2_load_config_rejects_external_enforcement_with_dns_nft(tmp_path, monkeypatch):
+    """External enforcement with an in-pod nftables mode is refused at config load.
+
+    The sidecar refuses the pair at startup. A server that accepted it would start
+    cleanly and then give every sandbox with a networkPolicy a crash-looping sidecar,
+    which the client sees only as a create that times out.
+    """
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        mode = "dns+nft"
+        enforcement = "external"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    with pytest.raises(ValidationError) as excinfo:
+        config_module.load_config(config_path)
+    message = str(excinfo.value)
+    assert "egress.enforcement" in message and "egress.mode" in message, message
+
+
+def test_wm2_load_config_rejects_upstream_proxy_with_external_enforcement(tmp_path, monkeypatch):
+    """[egress.upstream_proxy] needs dns+nft, which external enforcement refuses.
+
+    Refused naming the proxy, rather than answering "requires dns+nft" -- advice the
+    check above would then refuse in turn.
+    """
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        mode = "dns+nft"
+        enforcement = "external"
+
+        [egress.upstream_proxy]
+        url = "http://proxy.example.com:3128"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    with pytest.raises(ValidationError) as excinfo:
+        config_module.load_config(config_path)
+    message = str(excinfo.value)
+    assert "egress.upstream_proxy" in message and "external" in message, message
+
+
+def test_wm2_load_config_rejects_external_enforcement_that_disables_ipv6(tmp_path, monkeypatch):
+    """External enforcement with disable_ipv6 left at its default is refused at load.
+
+    On Kubernetes disable_ipv6 is carried out by a privileged init container, which is
+    exactly what a pod under external enforcement -- gVisor, a restricted namespace --
+    may not have. Accepted, every create with a networkPolicy times out, the reason only
+    in the namespace events. Refused naming both keys instead.
+    """
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        mode = "dns"
+        enforcement = "external"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    with pytest.raises(ValidationError) as excinfo:
+        config_module.load_config(config_path)
+    message = str(excinfo.value)
+    assert "egress.enforcement" in message and "egress.disable_ipv6" in message, message
+
+
 def test_wm4_env_override_without_a_tenants_block_does_not_crash(tmp_path, monkeypatch):
     """A single-tenant server must still start when the variable happens to be set.
 

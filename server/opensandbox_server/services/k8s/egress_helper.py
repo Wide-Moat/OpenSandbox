@@ -28,6 +28,7 @@ from opensandbox_server.services.constants import (
     EGRESS_RULES_ENV,
     OTEL_EXPORTER_OTLP_ENDPOINT,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
+    OPENSANDBOX_EGRESS_ENFORCEMENT,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
     OPENSANDBOX_EGRESS_TOKEN,
@@ -35,6 +36,7 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
 )
 from opensandbox_server.services.helpers import upstream_proxy_egress_env
+from opensandbox_server.config import EGRESS_ENFORCEMENT_EXTERNAL
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 
 _IPV6_DISABLE_PATH = "/proc/sys/net/ipv6/conf/all/disable_ipv6"
@@ -123,13 +125,24 @@ def apply_egress_to_spec(
                 continue
             env.append({"name": name, "value": value or ""})
 
+    external = egress_settings.enforcement == EGRESS_ENFORCEMENT_EXTERNAL
+    if external:
+        # Server-side, after the request-derived block above, so a request cannot set
+        # it: the value is a property of the cluster, and a sandbox able to choose it
+        # could tell its own sidecar to install nothing.
+        env.append({"name": OPENSANDBOX_EGRESS_ENFORCEMENT, "value": EGRESS_ENFORCEMENT_EXTERNAL})
+
     sidecar: Dict[str, Any] = {
         "name": "egress",
         "image": egress_settings.image,
         "env": env,
-        "securityContext": {
-            "capabilities": {"add": ["NET_ADMIN"]},
-        },
+        # NET_ADMIN exists so the sidecar can install redirects in the sandbox network
+        # namespace. Enforcing externally it installs none, so the capability is not
+        # merely unnecessary: under a sandboxed kernel it cannot be granted at all, and
+        # an admission policy that forbids added capabilities rejects the pod outright.
+        "securityContext": (
+            {} if external else {"capabilities": {"add": ["NET_ADMIN"]}}
+        ),
         "ports": [{"name": "egress-api", "containerPort": 18080}],
         "readinessProbe": {
             "httpGet": {

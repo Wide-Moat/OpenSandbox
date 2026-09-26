@@ -94,6 +94,9 @@ EGRESS_MODE_DNS_NFT = "dns+nft"
 _UPSTREAM_PROXY_HOST_ASCII = frozenset(
     string.ascii_letters + string.digits + "-._~!$&'()*+,;=:[]<>\""
 )
+# Where egress is enforced, which is a different question from what it filters.
+EGRESS_ENFORCEMENT_SIDECAR = "sidecar"
+EGRESS_ENFORCEMENT_EXTERNAL = "external"
 
 
 def _is_valid_kubernetes_container_resource_name(name: str) -> bool:
@@ -947,6 +950,23 @@ class EgressConfig(BaseModel):
         default=EGRESS_MODE_DNS,
         description="Egress enforcement passed to the sidecar as OPENSANDBOX_EGRESS_MODE (dns or dns+nft).",
     )
+    enforcement: Literal[
+        EGRESS_ENFORCEMENT_SIDECAR,
+        EGRESS_ENFORCEMENT_EXTERNAL,
+    ] = Field(
+        default=EGRESS_ENFORCEMENT_SIDECAR,
+        description=(
+            "Where egress is enforced. 'sidecar' (default) is unchanged behaviour: the "
+            "sidecar installs the DNS and HTTP redirects in the sandbox network namespace "
+            "and is given CAP_NET_ADMIN to do it. 'external' says something outside the "
+            "pod already constrains the traffic -- a CNI-level policy -- so the sidecar "
+            "installs no netfilter rules and is given no capabilities, and nothing in the "
+            "pod enforces a sandbox's networkPolicy any more. Required under a sandboxed "
+            "kernel such as gVisor, where netfilter does not exist and CAP_NET_ADMIN "
+            "cannot be granted. Kubernetes only; requires mode = 'dns' and "
+            "disable_ipv6 = false."
+        ),
+    )
     disable_ipv6: bool = Field(
         default=DEFAULT_EGRESS_DISABLE_IPV6,
         description=(
@@ -1045,6 +1065,41 @@ class EgressConfig(BaseModel):
             limit = limits[resource_name]
             if parse_quantity(request) > parse_quantity(limit):
                 raise ValueError(f"resource request for {resource_name!r} ({request!r}) must not exceed limit ({limit!r})")
+        return self
+
+    # ⚠ BEFORE validate_upstream_proxy_requires_dns_nft: validators run in the order they
+    # are defined, and for an upstream proxy under external enforcement that one would
+    # otherwise answer "requires dns+nft" -- advice this one then refuses.
+    @model_validator(mode="after")
+    def validate_external_enforcement_installs_no_nftables(self) -> EgressConfig:
+        # The sidecar refuses this pair at startup (components/egress/main.go), so
+        # accepting it here would start a server whose every sandbox with a
+        # networkPolicy crash-loops its sidecar. Refused at config load instead, the
+        # same reasoning as the upstream-proxy check below.
+        if self.enforcement != EGRESS_ENFORCEMENT_EXTERNAL:
+            return self
+        if self.upstream_proxy is not None:
+            raise ValueError(
+                'egress.upstream_proxy cannot be used with egress.enforcement = "external": '
+                'it requires egress.mode = "dns+nft", which is an in-pod nftables policy'
+            )
+        if self.mode == EGRESS_MODE_DNS_NFT:
+            raise ValueError(
+                'egress.enforcement = "external" installs no netfilter rules in the pod, '
+                'but egress.mode = "dns+nft" is an in-pod nftables policy; '
+                'use egress.mode = "dns" with external enforcement'
+            )
+        # On Kubernetes disable_ipv6 is carried out by a PRIVILEGED init container, and
+        # external enforcement exists for pods that may have none: under gVisor it is
+        # refused by the namespace's admission policy, and the create times out with the
+        # reason only in the namespace events. IPv6 is then the outside policy's to
+        # constrain, like everything else.
+        if self.disable_ipv6:
+            raise ValueError(
+                'egress.enforcement = "external" gives the pod no privileged container, '
+                'but egress.disable_ipv6 = true (the default) is carried out by one; '
+                'set egress.disable_ipv6 = false with external enforcement'
+            )
         return self
 
     @model_validator(mode="after")

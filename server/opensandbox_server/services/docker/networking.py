@@ -35,6 +35,7 @@ from docker.errors import DockerException, NotFound as DockerNotFound
 from fastapi import HTTPException, status
 
 from opensandbox_server.api.schema import Endpoint, NetworkPolicy
+from opensandbox_server.config import EGRESS_ENFORCEMENT_SIDECAR
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
     EGRESS_RULES_ENV,
@@ -56,7 +57,10 @@ from opensandbox_server.services.endpoint_auth import (
     build_egress_auth_headers,
     merge_endpoint_headers,
 )
-from opensandbox_server.services.helpers import upstream_proxy_egress_env
+from opensandbox_server.services.helpers import (
+    egress_enforcement,
+    upstream_proxy_egress_env,
+)
 from opensandbox_server.services.validators import (
     ensure_credential_proxy_configured,
     ensure_egress_configured,
@@ -184,10 +188,35 @@ class DockerNetworkingMixin:
 
         # Common validation: egress.image must be configured
         ensure_egress_configured(request.network_policy, self.app_config.egress)
+        # The credential proxy's dns+nft requirement is judged as SIDECAR enforcement,
+        # for the reason given below: this runtime never tells its sidecar that
+        # enforcement is external, so the sidecar enforces in the pod as before, and in
+        # mode "dns" nothing stops a client reaching a credential's destination by
+        # address. The configured value would skip the requirement for a guarantee
+        # nothing here makes. The mode is still read from the configuration.
+        egress_config = self.app_config.egress
+        if (
+            egress_config is not None
+            and egress_enforcement(egress_config) != EGRESS_ENFORCEMENT_SIDECAR
+        ):
+            egress_config = egress_config.model_copy(
+                update={"enforcement": EGRESS_ENFORCEMENT_SIDECAR}
+            )
         ensure_credential_proxy_configured(
-            request.credential_proxy, request.network_policy, self.app_config.egress
+            request.credential_proxy, request.network_policy, egress_config
         )
-        ensure_egress_runtime_compatible(request.network_policy, self.app_config.secure_runtime)
+        # Deliberately NOT passing egress_config here, unlike the Kubernetes path.
+        #
+        # External enforcement means something outside the pod constrains the traffic --
+        # a CNI policy on the host side of the veth. The Docker runtime has no such
+        # thing, and _start_egress_sidecar below still adds NET_ADMIN and installs the
+        # redirects unconditionally. Accepting the setting here would make it a claim
+        # the sidecar does not honour: the validator would pass and the sandbox would be
+        # enforced the old way, with nothing saying so.
+        ensure_egress_runtime_compatible(
+            request.network_policy,
+            self.app_config.secure_runtime,
+        )
 
     def _ensure_secure_access_support(self, request) -> None:
         """Validate that secure access can be honored under the current Docker runtime."""

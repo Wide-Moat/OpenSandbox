@@ -31,6 +31,7 @@ from opensandbox_server.config import (
     EgressConfig,
     EgressUpstreamProxyConfig,
     RuntimeConfig,
+    SecureRuntimeConfig,
     ServerConfig,
     StorageConfig,
     IngressConfig,
@@ -1002,6 +1003,91 @@ async def test_credential_proxy_requires_dns_nft_mode(mock_docker):
     assert exc.value.status_code == status.HTTP_400_BAD_REQUEST
     assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
     assert "dns+nft" in exc.value.detail["message"]
+
+
+@pytest.mark.asyncio
+@patch("opensandbox_server.services.docker.docker_service.docker")
+async def test_wm2_docker_credential_proxy_still_requires_dns_nft_under_external_enforcement(
+    mock_docker,
+):
+    # [egress] enforcement = "external" says something OUTSIDE the pod constrains the
+    # traffic. The Docker runtime has no such thing, and never tells its sidecar about
+    # the setting, so the sidecar enforces in the pod exactly as before -- with only DNS
+    # filtering in mode "dns". Skipping the dns+nft requirement there would substitute
+    # credentials while their destinations stay reachable by address.
+    #
+    # The field is set only where it exists, so on upstream, which has no such field,
+    # this is the plain requirement and must hold too.
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    egress = {"image": "egress:latest", "mode": "dns", "disable_ipv6": False}
+    if "enforcement" in EgressConfig.model_fields:
+        egress["enforcement"] = "external"
+    cfg.egress = EgressConfig(**egress)
+    service = DockerSandboxService(config=cfg)
+
+    request = CreateSandboxRequest(
+        image=ImageSpec(uri="python:3.11"),
+        timeout=120,
+        resourceLimits=ResourceLimits(root={}),
+        env={},
+        metadata={},
+        entrypoint=["python"],
+        networkPolicy=NetworkPolicy(default_action="deny", egress=[]),
+        credentialProxy=CredentialProxyConfig(enabled=True),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await service.create_sandbox(request)
+
+    assert exc.value.status_code == status.HTTP_400_BAD_REQUEST
+    assert "dns+nft" in exc.value.detail["message"]
+
+
+@pytest.mark.asyncio
+@patch("opensandbox_server.services.docker.docker_service.docker")
+async def test_wm2_docker_still_rejects_gvisor_with_network_policy_under_external_enforcement(
+    mock_docker,
+):
+    # The rejection the Docker gVisor warning predicts. The Docker sidecar still gets
+    # NET_ADMIN and installs its redirects in the pod whatever [egress] says -- runsc
+    # has no netfilter for them -- so the refusal must stay, and the Docker call site
+    # must keep not passing [egress] to the validator that would lift it.
+    #
+    # The field is set only where it exists; on upstream this is the plain refusal.
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+    mock_client.info.return_value = {"Runtimes": {"runsc": {"path": "/usr/bin/runsc"}}}
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.secure_runtime = SecureRuntimeConfig(type="gvisor", docker_runtime="runsc")
+    egress = {"image": "egress:latest", "mode": "dns", "disable_ipv6": False}
+    if "enforcement" in EgressConfig.model_fields:
+        egress["enforcement"] = "external"
+    cfg.egress = EgressConfig(**egress)
+    service = DockerSandboxService(config=cfg)
+
+    request = CreateSandboxRequest(
+        image=ImageSpec(uri="python:3.11"),
+        timeout=120,
+        resourceLimits=ResourceLimits(root={}),
+        env={},
+        metadata={},
+        entrypoint=["python"],
+        networkPolicy=NetworkPolicy(default_action="deny", egress=[]),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await service.create_sandbox(request)
+
+    assert exc.value.status_code == status.HTTP_400_BAD_REQUEST
+    assert "gvisor" in str(exc.value.detail).lower()
 
 
 @pytest.mark.asyncio
