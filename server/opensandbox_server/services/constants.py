@@ -86,6 +86,11 @@ EGRESS_UPSTREAM_EXTRA_CA_PATH = (
 )
 EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME = "opensandbox-egress-upstream-extra-ca"
 EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY = "ca.crt"
+# Where enforcement lives. Server-side only, and deliberately NOT in
+# ALLOWED_EGRESS_ENV_VARS below: it is a property of the cluster, and a request able
+# to set it could tell the sidecar to install nothing and so unfilter its own sandbox.
+# Must match components/egress/pkg/constants/configuration.go EnvEnforcement.
+OPENSANDBOX_EGRESS_ENFORCEMENT = "OPENSANDBOX_EGRESS_ENFORCEMENT"
 ALLOWED_EGRESS_ENV_VARS = frozenset({
     "OPENSANDBOX_EGRESS_LOG_LEVEL",
     "OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT",
@@ -228,6 +233,7 @@ __all__ = [
     "EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME",
     "EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY",
     "ALLOWED_EGRESS_ENV_VARS",
+    "OPENSANDBOX_EGRESS_ENFORCEMENT",
     "OPENSANDBOX_RUNTIME_VOLUME_NAME",
     "OPENSANDBOX_RUNTIME_MOUNT_PATH",
     "OPENSANDBOX_LIFECYCLE",

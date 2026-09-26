@@ -40,6 +40,7 @@ from opensandbox_server.services.constants import (
     OPEN_SANDBOX_INGRESS_HEADER,
 )
 from opensandbox_server.config import (
+    EGRESS_ENFORCEMENT_SIDECAR,
     GATEWAY_ROUTE_MODE_HEADER,
     GATEWAY_ROUTE_MODE_URI,
     GATEWAY_ROUTE_MODE_WILDCARD,
@@ -313,6 +314,14 @@ def upstream_proxy_egress_env(
     return env
 
 
+def egress_enforcement(egress_config: Optional[EgressConfig]) -> str:
+    """Where egress is enforced for this configuration: ``[egress] enforcement``, or
+    ``"sidecar"`` when there is no ``[egress]`` block."""
+    if egress_config is None:
+        return EGRESS_ENFORCEMENT_SIDECAR
+    return egress_config.enforcement
+
+
 def validate_upstream_proxy_request(
     egress_config: Optional[EgressConfig],
     *,
@@ -360,5 +369,6 @@ __all__ = [
     "matches_filter",
     "split_egress_env",
     "upstream_proxy_egress_env",
+    "egress_enforcement",
     "validate_upstream_proxy_request",
 ]
