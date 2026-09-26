@@ -199,22 +199,17 @@ def smoke_legacy():
     r = requests.get(f"{BASE_URL}/metrics", headers=auth(LEGACY_TOKEN), timeout=5)
     expect(r.status_code == 200, f"legacy-token /metrics expected 200, got {r.status_code}")
 
-    # A late /internal/init is accepted and becomes authoritative.
+    # Outside runtime-init mode /internal/init is not served (WM-12): it takes no
+    # access token, so answering it would let anyone who can reach the port replace
+    # the token this execd was started with.
     r = requests.post(f"{BASE_URL}/internal/init", json=init_payload(), timeout=30)
-    expect(r.status_code == 200, f"/internal/init failed: {r.status_code} {r.text}")
+    expect(r.status_code == 404, f"legacy /internal/init expected 404, got {r.status_code} {r.text}")
+    expect("--runtime-init" in r.text, f"legacy /internal/init 404 did not come from the refusal: {r.text}")
 
     r = requests.get(f"{BASE_URL}/metrics", headers=auth(LEGACY_TOKEN), timeout=5)
-    expect(r.status_code == 401, f"legacy-token /metrics expected 401 after init, got {r.status_code}")
+    expect(r.status_code == 200, f"legacy-token /metrics expected 200 after a refused init, got {r.status_code}")
     r = requests.get(f"{BASE_URL}/metrics", headers=auth(NEW_TOKEN), timeout=5)
-    expect(r.status_code == 200, f"new-token /metrics expected 200 after init, got {r.status_code}")
-
-    # Explicit preserve is independent of whether this is the first call.
-    r = requests.post(
-        f"{BASE_URL}/internal/init",
-        json=init_payload(preserveRuntimeState=True),
-        timeout=5,
-    )
-    expect(r.status_code == 200, f"preserving /internal/init expected 200, got {r.status_code}")
+    expect(r.status_code == 401, f"a refused init must not install its token, got {r.status_code}")
 
 
 def main():
