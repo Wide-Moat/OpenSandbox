@@ -54,6 +54,7 @@ DEFAULT_CONFIG_PATH = Path.home() / ".sandbox.toml"
 
 API_KEY_ENV_VAR = "OPENSANDBOX_SERVER_API_KEY"
 POSTGRESQL_DSN_ENV_VAR = "OPENSANDBOX_STORE_POSTGRESQL_DSN"
+TENANTS_AUTH_TOKEN_ENV_VAR = "OPENSANDBOX_TENANTS_AUTH_TOKEN"
 
 # OSEP-0011 secure-access keys may be injected via environment instead of the
 # [ingress.secure_access] TOML block, so key material can come from a Secret
@@ -1380,7 +1381,12 @@ class TenantsConfig(BaseModel):
     )
     auth_token: Optional[str] = Field(
         default=None,
-        description="Optional token value for provider-level authentication to HTTP endpoint.",
+        description=(
+            "Optional token value for provider-level authentication to HTTP endpoint. "
+            f"Prefer the {TENANTS_AUTH_TOKEN_ENV_VAR} environment variable, which "
+            "overrides this field, so the shared secret need not be written into the "
+            "configuration file."
+        ),
     )
 
     @model_validator(mode="after")
@@ -1508,6 +1514,19 @@ def _apply_env_overrides(config: AppConfig) -> None:
     """Apply environment variable overrides to parsed configuration."""
     if API_KEY_ENV_VAR in os.environ:
         config.server.api_key = os.environ[API_KEY_ENV_VAR]
+    if TENANTS_AUTH_TOKEN_ENV_VAR in os.environ:
+        # `tenants` is None when the TOML has no [tenants] block, which is the ordinary
+        # single-tenant server. Setting the attribute there would raise AttributeError
+        # and refuse to start a configuration that is perfectly valid -- and the message
+        # would name neither the variable nor the missing block.
+        if config.tenants is None:
+            logger.warning(
+                "%s is set but the configuration has no [tenants] block; "
+                "the override applies to the HTTP tenant provider and is ignored here",
+                TENANTS_AUTH_TOKEN_ENV_VAR,
+            )
+        else:
+            config.tenants.auth_token = os.environ[TENANTS_AUTH_TOKEN_ENV_VAR]
     _apply_secure_access_env_overrides(config)
 
 
