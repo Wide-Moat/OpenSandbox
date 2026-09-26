@@ -49,7 +49,7 @@ func NewRouter(accessToken string) *gin.Engine {
 	r.Use(logMiddleware(), otelHTTPMetricsMiddleware(), runtimeInitGate(), accessTokenMiddleware(accessToken), ProxyMiddleware())
 
 	r.GET("/ping", controller.PingHandler)
-	r.POST("/internal/init", withInit(func(c *controller.InitController) { c.Init() }))
+	r.POST("/internal/init", internalInitOnlyInRuntimeInitMode, withInit(func(c *controller.InitController) { c.Init() }))
 	r.GET("/ready", withInit(func(c *controller.InitController) { c.Ready() }))
 
 	files := r.Group("/files")
@@ -173,6 +173,26 @@ func withInit(fn func(*controller.InitController)) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		fn(controller.NewInitController(ctx))
 	}
+}
+
+// internalInitOnlyInRuntimeInitMode refuses POST /internal/init unless execd runs with
+// --runtime-init (WM-12).
+//
+// /internal/init takes no access token -- it has to work before one exists -- and it
+// replaces the RuntimeBinding: the token hash, the environment, the lifecycle. Only a
+// control plane that started execd in runtime-init mode sends it. Without that mode
+// nothing is waiting for it, and answering it anyway lets anyone who can reach the port
+// rebind execd -- through a gateway that forwards every path, from another pod, from
+// the sandbox itself -- and does so even once execd has a token. So outside runtime-init
+// mode the route answers as if it did not exist.
+func internalInitOnlyInRuntimeInitMode(ctx *gin.Context) {
+	if flag.RuntimeInit {
+		ctx.Next()
+		return
+	}
+	ctx.AbortWithStatusJSON(http.StatusNotFound, map[string]any{
+		"error": "/internal/init is served only when execd runs with --runtime-init",
+	})
 }
 
 // accessTokenMiddleware guards API entrypoints. Once a RuntimeBinding with

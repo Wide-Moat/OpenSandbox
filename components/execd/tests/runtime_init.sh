@@ -22,8 +22,8 @@
 #     container token and /init envs reach user processes; an explicit
 #     preserve request replaces the binding without restarting processes.
 #   Phase 2 (legacy fallback): /ready turns 200 after the template-driven
-#     startup; a late /init switches auth to the binding hash, and an explicit
-#     preserve request may replace it without runtime cleanup.
+#     startup; a late /init is not served (WM-12) and the container token
+#     stays the one that authenticates.
 #
 # Prerequisites: ./bin/execd (run `make build` first), python3 + requests.
 #
