@@ -162,7 +162,9 @@ func TestRuntimeInitGateDisabledByDefault(t *testing.T) {
 
 func TestNewRouterServesInitRoutes(t *testing.T) {
 	withTestBinding(t, nil)
-	withRuntimeInit(t, false)
+	// Runtime-init mode: outside it /internal/init is not served (WM-12,
+	// internal_init_test.go).
+	withRuntimeInit(t, true)
 	withManager(t, false)
 	r := NewRouter("")
 
