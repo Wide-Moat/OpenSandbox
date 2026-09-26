@@ -345,7 +345,22 @@ func (v *Store) ValidateActiveAgainstPolicy(pol *policy.NetworkPolicy) error {
 	return v.validateCandidate(v.credentials, v.bindings, pol)
 }
 
+// Ready reports whether a vault write may proceed: every static precondition, then the
+// wait for the credential proxy to come up.
 func (v *Store) Ready(ctx context.Context) error {
+	if err := v.Preconditions(); err != nil {
+		return err
+	}
+	if v.mitmGate != nil && !v.mitmGate.WaitReady(ctx) {
+		return fmt.Errorf("credential proxy is not ready")
+	}
+	return nil
+}
+
+// Preconditions is Ready without the wait for the credential proxy: the checks that do
+// not depend on mitmdump having started. The startup seed runs before mitmdump exists
+// and applies exactly these.
+func (v *Store) Preconditions() error {
 	if v.requireToken != nil && !v.requireToken() {
 		return fmt.Errorf("credential vault requires egress API auth token")
 	}
@@ -364,9 +379,6 @@ func (v *Store) Ready(ctx context.Context) error {
 	// does not apply to it.
 	if !constants.EnforcementIsExternal() && !constants.ModeUsesNft(os.Getenv(constants.EnvEgressMode)) {
 		return fmt.Errorf("credential vault requires dns+nft egress enforcement")
-	}
-	if v.mitmGate != nil && !v.mitmGate.WaitReady(ctx) {
-		return fmt.Errorf("credential proxy is not ready")
 	}
 	return nil
 }
@@ -1208,12 +1220,15 @@ func dedupeStringsInPlace(values *[]string) {
 
 func ReadJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxCredentialVaultBodyBytes))
+	return DecodeJSON(r.Body, dst)
+}
+
+// DecodeJSON decodes a credential-vault request body the way the API does: size-capped,
+// unknown fields refused.
+func DecodeJSON(body io.Reader, dst any) error {
+	dec := json.NewDecoder(io.LimitReader(body, maxCredentialVaultBodyBytes))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return err
-	}
-	return nil
+	return dec.Decode(dst)
 }
 
 func WriteError(w http.ResponseWriter, err error) {

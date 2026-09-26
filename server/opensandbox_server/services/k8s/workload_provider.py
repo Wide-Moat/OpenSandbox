@@ -41,6 +41,9 @@ class EgressWorkloadSettings:
     resource_limits: Optional[Dict[str, str]]
     otlp_endpoint: Optional[str] = None
     upstream_proxy: Optional[EgressUpstreamProxyConfig] = None
+    # A credential-vault CreateRequest to load before the sandbox starts (WM-8). None by
+    # default, which is the existing behaviour.
+    credential_vault_seed: Optional[Dict[str, Any]] = None
     # Where egress is enforced. Defaults to "sidecar", which is unchanged behaviour;
     # see EgressConfig.enforcement. Server-side only — never request-derived, unlike
     # `env` above, because a request able to set it could unfilter its own sandbox.
