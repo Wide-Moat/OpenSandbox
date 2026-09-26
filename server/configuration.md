@@ -458,6 +458,7 @@ These are read by the server or runtime code in addition to the TOML file:
 |----------|------------|-------------|
 | `SANDBOX_CONFIG_PATH` | `config.py`, CLI | Path to the TOML file. Overrides the default `~/.sandbox.toml` when set. |
 | `OPENSANDBOX_SERVER_API_KEY` | `config.py` | Overrides the API key from the TOML file. |
+| `OPENSANDBOX_TENANTS_AUTH_TOKEN` | `config.py` | Overrides `[tenants] auth_token`, the secret shared with an HTTP tenant provider, so the TOML file need not be a secret. Ignored when there is no `[tenants]` block. See [Multi-tenancy](../docs/guides/multi-tenancy.md). |
 | `DOCKER_HOST` | Docker service | Standard Docker daemon address (e.g. `unix:///var/run/docker.sock`). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTEL exporter | Default OTLP endpoint when `[otel].endpoint` is omitted. |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | OTEL exporter | Metrics-specific OTLP endpoint override. |
