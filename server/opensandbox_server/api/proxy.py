@@ -18,9 +18,10 @@ HTTP and WebSocket proxy routes for reaching services inside sandboxes via the l
 
 import hmac
 import logging
-from collections.abc import AsyncIterator, Mapping
+import posixpath
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import anyio
 import httpx
@@ -38,7 +39,12 @@ from opensandbox_server.api import lifecycle
 from opensandbox_server.config import get_config
 from opensandbox_server.api.schema import Endpoint
 from opensandbox_server.middleware.auth import SANDBOX_API_KEY_HEADER
-from opensandbox_server.services.constants import OPEN_SANDBOX_EGRESS_AUTH_HEADER, OPEN_SANDBOX_SECURE_ACCESS_HEADER
+from opensandbox_server.services.constants import (
+    EXECD_PORT,
+    OPEN_SANDBOX_EGRESS_AUTH_HEADER,
+    OPEN_SANDBOX_INGRESS_HEADER,
+    OPEN_SANDBOX_SECURE_ACCESS_HEADER,
+)
 from opensandbox_server.tenants.context import set_current_tenant
 from opensandbox_server.tenants.provider import TenantProviderUnavailable
 
@@ -72,6 +78,19 @@ PROXY_CONTROL_HEADERS = {
     ACCESS_RENEW_HEADER,
 }
 
+# ⚠ THE INGRESS GATEWAY ROUTES ON THESE, AND ONLY THIS SERVER MAY SET THEM. With
+# [ingress] mode=gateway and route mode "header", the endpoint a port resolves to is the
+# gateway plus "OpenSandbox-Ingress-To: <sandbox>-<port>". A caller's own copy, arriving
+# lowercased from uvicorn, is a different dict key from the endpoint's, so both went out
+# on the wire, the caller's first -- and the gateway reads the first. The caller then
+# chose the sandbox and the port (execd's /internal/init on another tenant's sandbox)
+# while every check here judged the port in the path. "OPEN-SANDBOX-INGRESS" is the
+# gateway's deprecated spelling, still read when the current one is absent.
+INGRESS_ROUTING_HEADERS = {
+    OPEN_SANDBOX_INGRESS_HEADER.lower(),
+    "open-sandbox-ingress",
+}
+
 SENSITIVE_HEADERS = {
     "authorization",
     "cookie",
@@ -98,6 +117,125 @@ WEBSOCKET_HANDSHAKE_HEADERS = {
 }
 
 router = APIRouter(tags=["Sandboxes"])
+
+# The prefix of the control-plane routes execd serves on EXECD_PORT.
+# POST /internal/init applies a RuntimeBinding -- the access-token hash, the environment,
+# the lifecycle -- and execd answers it WITHOUT its access token, because the call has
+# to work before a token exists. The control plane reaches it directly, never through
+# this proxy, so nothing a proxy caller legitimately needs lives under that prefix.
+_EXECD_INTERNAL_SEGMENT = "internal"
+# More rounds of percent-decoding than execd ever applies. gin decodes the path once,
+# and a hop through execd's own /proxy/ re-escapes what it forwards, so the execd behind
+# it decodes that to the same path again. A path that would reveal /internal/ only after
+# more rounds than this cannot reach it in execd, so it is forwarded, not refused: the
+# cap is where looking stops, not a reason to say no.
+_MAX_PATH_DECODE_ROUNDS = 4
+
+
+def _decoded_forms(full_path: str) -> Iterator[str]:
+    """Each form in which execd could route *full_path*, as execd would split it.
+
+    The path as it is and after each round of percent-decoding, up to the cap, stopping
+    once a round changes nothing. Each form is cut where the URL forwarded to execd is
+    split and has ``\\`` read as ``/``.
+
+    ⚠ A "?" OR "#" ENDS THE PATH. In a form it can only have come from a decoded %3F or
+    %23, and the forwarded URL is split there: the rest is a query or a fragment, which
+    execd does not route on. Resolving ".." across it would climb out of a path execd
+    never sees -- internal/init?/../../x is /x to that arithmetic and /internal/init to
+    execd. The decoding itself goes on over the uncut path.
+
+    Both refusals below are judged over these forms and nothing else, so a spelling one
+    of them sees the other sees too.
+    """
+    path = full_path
+    for _ in range(_MAX_PATH_DECODE_ROUNDS + 1):
+        yield path.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
+        decoded = unquote(path)
+        if decoded == path:
+            return
+        path = decoded
+
+
+def _reaches_execd_internal(port: int, full_path: str) -> bool:
+    """True when a proxied request would land on one of execd's /internal/ routes.
+
+    Answered for the path as execd will route it, not as it arrived. execd (gin, with
+    UseRawPath off) matches on the DECODED path, so ``internal%2Finit`` -- which this
+    server decodes once and forwards as ``%2F`` -- is ``/internal/init`` by the time
+    execd sees it. So every decoded form is checked. Dot segments and empty segments are
+    resolved the same way, and a hop through execd's own reverse proxy
+    (``/proxy/44772/...``, which it forwards to 127.0.0.1:44772, itself) is followed.
+    """
+    return port == EXECD_PORT and any(
+        _routes_to_execd_internal(form) for form in _decoded_forms(full_path)
+    )
+
+
+def _routes_to_execd_internal(form: str) -> bool:
+    """True when one of :func:`_decoded_forms` routes to an execd /internal/ route."""
+    # Dot and empty segments resolved lexically; the leading "/" keeps ".." from
+    # climbing above the root, and the filter drops the empty segments normpath keeps.
+    segments = [segment for segment in posixpath.normpath("/" + form).split("/") if segment]
+
+    while (
+        len(segments) >= 2
+        and segments[0].lower() == "proxy"
+        and _names_execd_port(segments[1])
+    ):
+        segments = segments[2:]
+
+    return bool(segments) and segments[0].lower() == _EXECD_INTERNAL_SEGMENT
+
+
+def _names_execd_port(segment: str) -> bool:
+    """True when Go's dialer would read *segment* as execd's port.
+
+    ASCII digits only, as Go accepts, and compared without int(): any number of leading
+    zeros is the same port to Go, while str.isdigit() also admits digits such as "²"
+    that int() then rejects, and int() refuses a segment longer than 4300 digits.
+    """
+    return (
+        segment.isascii()
+        and segment.isdigit()
+        and segment.lstrip("0") == str(EXECD_PORT)
+    )
+
+
+_EXECD_INTERNAL_REFUSAL = (
+    "execd's /internal/ routes are the control plane's and are not reachable "
+    "through the sandbox proxy."
+)
+
+
+def _leaves_the_proxied_port(full_path: str) -> bool:
+    """True when dot segments in *full_path* climb above the root of the port it names.
+
+    ⚠ THE PORT IN THE URL IS NOT ALWAYS WHERE THE REQUEST GOES. The endpoint a port
+    resolves to can carry a path of its own: on Docker every port but 8080 is reached
+    through execd itself, as ``<host>:<execd>/proxy/<port>``. The path is appended to
+    that, and httpx resolves dot segments before sending -- so ``1234/../../internal/init``
+    is ``/internal/init`` on execd, whatever the port check above concluded about 1234.
+    Refusing any climb out of the port's root closes that for every runtime and every
+    endpoint shape, rather than for the one shape the port check knows. Nothing a client
+    legitimately sends climbs out of the root it named; the API-key check already refuses
+    such a path from anonymous callers.
+
+    Judged, like the execd check, over every one of :func:`_decoded_forms`.
+    """
+    return any(_climbs_above_root(form) for form in _decoded_forms(full_path))
+
+
+def _climbs_above_root(form: str) -> bool:
+    # Relative on purpose: normpath keeps a leading ".." only on a relative path.
+    resolved = posixpath.normpath(form.lstrip("/") or ".")
+    return resolved == ".." or resolved.startswith("../")
+
+
+_PROXY_PATH_LEAVES_PORT_REFUSAL = (
+    "the proxied path climbs out of the port it names; dot segments above its root "
+    "are not forwarded."
+)
 
 
 def _build_proxy_target_url(
@@ -142,7 +280,11 @@ def _filter_proxy_headers(
     path, so egress-auth credentials resolved from the endpoint are preserved.
     """
     excluded = (
-        set(HOP_BY_HOP_HEADERS) | set(SENSITIVE_HEADERS) | set(FORWARDED_HEADERS) | PROXY_CONTROL_HEADERS
+        set(HOP_BY_HOP_HEADERS)
+        | set(SENSITIVE_HEADERS)
+        | set(FORWARDED_HEADERS)
+        | PROXY_CONTROL_HEADERS
+        | INGRESS_ROUTING_HEADERS
     )
     if extra_excluded:
         excluded.update(extra_excluded)
@@ -171,13 +313,16 @@ def _filter_proxy_headers(
                 for k, v in forwarded.items()
                 if k.lower() != OPEN_SANDBOX_EGRESS_AUTH_HEADER.lower()
             }
-        forwarded.update(
-            {
-                key: value
-                for key, value in endpoint_headers.items()
-                if key.lower() not in endpoint_header_excluded
-            }
-        )
+        resolved = {
+            key: value
+            for key, value in endpoint_headers.items()
+            if key.lower() not in endpoint_header_excluded
+        }
+        # A header the endpoint sets replaces the caller's in any spelling. Keys here
+        # are case-sensitive and HTTP names are not, so update() alone would send both.
+        resolved_names = {key.lower() for key in resolved}
+        forwarded = {k: v for k, v in forwarded.items() if k.lower() not in resolved_names}
+        forwarded.update(resolved)
     return forwarded
 
 
@@ -349,6 +494,24 @@ async def _proxy_http_request(
     *,
     internal: bool = False,
 ) -> StreamingResponse:
+    # Before the endpoint is resolved: a refused request costs no lookup and does not
+    # renew the sandbox. Server-managed routes (internal=True) never target execd.
+    if not internal and _leaves_the_proxied_port(full_path):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "PROXY_PATH_LEAVES_PORT",
+                "message": _PROXY_PATH_LEAVES_PORT_REFUSAL,
+            },
+        )
+    if not internal and _reaches_execd_internal(port, full_path):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "EXECD_INTERNAL_PATH_FORBIDDEN",
+                "message": _EXECD_INTERNAL_REFUSAL,
+            },
+        )
     resolve_internal = get_config().proxy.resolve_internal
     endpoint = lifecycle.sandbox_service.get_endpoint(
         sandbox_id,
@@ -542,6 +705,17 @@ async def _proxy_websocket_request(
     full_path: str,
 ) -> None:
     if not await _authenticate_websocket_tenant(websocket):
+        return
+
+    if _leaves_the_proxied_port(full_path):
+        await _fail_client_websocket(
+            websocket, status.WS_1008_POLICY_VIOLATION, _PROXY_PATH_LEAVES_PORT_REFUSAL
+        )
+        return
+    if _reaches_execd_internal(port, full_path):
+        await _fail_client_websocket(
+            websocket, status.WS_1008_POLICY_VIOLATION, _EXECD_INTERNAL_REFUSAL
+        )
         return
 
     try:
