@@ -355,7 +355,14 @@ func (v *Store) Ready(ctx context.Context) error {
 	if constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
 		return fmt.Errorf("credential vault rejects insecure upstream TLS mode")
 	}
-	if !constants.ModeUsesNft(os.Getenv(constants.EnvEgressMode)) {
+	// The dns+nft requirement is about IN-POD enforcement: without nftables the
+	// sidecar cannot stop a client from reaching a credential's destination by some
+	// other route, so substituting the credential would be a false promise. When
+	// enforcement is external that guarantee is made by whatever enforces outside —
+	// a CNI policy on the host side of the veth — and demanding a subsystem the
+	// sandboxed kernel does not have would refuse the configuration for a reason that
+	// does not apply to it.
+	if !constants.EnforcementIsExternal() && !constants.ModeUsesNft(os.Getenv(constants.EnvEgressMode)) {
 		return fmt.Errorf("credential vault requires dns+nft egress enforcement")
 	}
 	if v.mitmGate != nil && !v.mitmGate.WaitReady(ctx) {

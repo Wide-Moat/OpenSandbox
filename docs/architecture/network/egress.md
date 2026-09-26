@@ -101,6 +101,42 @@ Egress is designed to be the only transparent outbound interception layer in the
 
 Both layers rewrite outbound traffic in the same namespace, so per-sandbox policy, transparent MITM, and Credential Vault cannot be relied on alongside mesh injection. Prefer excluding sandbox pods from mesh injection, or enforce outbound policy with a CNI-level mechanism instead. The same constraint applies to gVisor: its netstack does not implement the redirect mechanism egress requires — use a Kata runtime, which provides comparable isolation and full egress support (see the [compatibility matrix](/guides/secure-container#compatibility-matrix)).
 
+## Enforcement outside the pod
+
+`OPENSANDBOX_EGRESS_ENFORCEMENT=external` tells the sidecar that egress is constrained by something outside the pod — a CNI-level policy on the host side of the veth, an admission policy — and that it must not install netfilter rules of its own. The default, `sidecar`, is the behaviour described everywhere else on this page; an unrecognised value is refused at startup rather than treated as the default.
+
+This is the mode for a sandbox under a **sandboxed kernel such as gVisor** that still wants Credential Vault while a CNI-level FQDN policy does the enforcement — the arrangement the [network isolation guide](/architecture/network/network-isolation#runtime-compatibility) describes. There nftables and iptables do not exist as subsystems and `CAP_NET_ADMIN` cannot be granted, so the default path fails at startup:
+
+```
+failed to install iptables redirect: nft DNS redirect cleanup failed:
+  netlink: Error: cache initialization failed: Operation not permitted
+supervisor: crashloop budget exceeded
+```
+
+What changes with `external`:
+
+| | `sidecar` (default) | `external` |
+|---|---|---|
+| DNS redirect (`OUTPUT 53 → 15353`) | installed | not installed, so the sidecar's DNS filter is out of the sandbox's path |
+| HTTP/HTTPS redirect | installed | not installed; clients use `HTTPS_PROXY` |
+| mitmproxy mode | `--mode transparent@…` (destination from `SO_ORIGINAL_DST`) | `--mode regular@…` (destination from `CONNECT`) |
+| `SO_MARK` on the proxy's own upstream queries | set, so the redirect can `RETURN` them | not set — there is no rule to bypass, and marking needs `CAP_NET_ADMIN` |
+| Per-sandbox `networkPolicy` | enforced in the pod, by the DNS filter and (with `dns+nft`) nftables | **enforced by nothing in the pod**; it only decides which hosts Credential Vault bindings may name |
+| Credential Vault | requires `OPENSANDBOX_EGRESS_MODE=dns+nft` | accepts `dns`; the address-level guarantee is made outside the pod |
+| `CAP_NET_ADMIN` | required | not required |
+| Shutdown | removes the redirects | nothing to remove |
+
+**The DNS filter cannot be put back in the path by configuration.** It listens on `127.0.0.1:15353` and `[::1]:15353` only, and a resolver setting — `/etc/resolv.conf`, a pod `dnsConfig` — has no port field: libc always asks port 53. Only the redirect this mode leaves out moves 53 to 15353. So under `external`, the per-sandbox allow/deny policy — from the create request and from `PATCH /networkpolicy` — is still validated, stored and served by the policy API, but no traffic in the pod is filtered by it. Name- and address-level enforcement is entirely the outside policy's, and it has to be configured to match.
+
+**What still works unchanged**: the policy API, the Credential Vault and its HTTP API (bindings are still checked against the effective policy), the mitmproxy addons, CA export, and the supervisor. The chained upstream proxy (`OPENSANDBOX_EGRESS_UPSTREAM_PROXY`) still requires `dns+nft`, whose nftables table lives in the pod, so it is not available where this mode is needed because nftables is absent.
+
+**What the operator must provide instead**, because the sidecar no longer does it:
+
+- `HTTPS_PROXY`/`HTTP_PROXY` in the sandbox pointing at the mitmproxy listener, and trust for the exported CA, since nothing redirects 80/443 any more;
+- egress enforcement outside the pod, by name and by address, since nothing inside it filters any more.
+
+This is a deliberate, opt-in exception to fail-closed startup: the sidecar starts without installing enforcement because enforcement is declared to exist elsewhere. Setting it without providing those leaves the sandbox **unfiltered**, which is why the default is `sidecar`.
+
 ## Shutdown
 
 On shutdown, the sidecar keeps DNS and network rules working while in-flight deliveries finish (a bounded window), then removes its network rules and flushes telemetry. Delivery is best effort — forced termination can drop events. Under Docker, deletion gives the sidecar a 9-second stop budget before forced termination; see [Docker deletion](/architecture/control-plane/server#docker-deletion). A lightweight supervisor restarts the sidecar on crash with exponential backoff and a crash-loop breaker, and cleans stale redirect state before a fresh start.

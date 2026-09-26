@@ -30,7 +30,6 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/dnsproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/events"
-	"github.com/alibaba/opensandbox/egress/pkg/iptables"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/nftables"
@@ -58,6 +57,15 @@ func main() {
 	upstreamSpec, err := upstreamProxySpecForProfile(profile)
 	if err != nil {
 		log.Fatalf("invalid upstream proxy configuration: %v", err)
+	}
+
+	// Refuse an unrecognised OPENSANDBOX_EGRESS_ENFORCEMENT before anything acts on it.
+	// Every call site asks EnforcementIsExternal, which reads a bad value as "not
+	// external" so a typo can never switch enforcement off -- but on its own that would
+	// run a misspelt "externl" down the sidecar path it was set to avoid, and under
+	// gVisor the only symptom would be a crash-loop about netlink.
+	if _, err := constants.ParseEnforcement(os.Getenv(constants.EnvEnforcement)); err != nil {
+		log.Fatalf("invalid enforcement configuration: %v", err)
 	}
 
 	// Fast Sandbox profile: multi-sandbox control plane over the slot
@@ -101,6 +109,16 @@ func main() {
 	allowIPs := allowIps()
 	mode := parseMode()
 	log.Infof("enforcement mode: %s", mode)
+	// External enforcement installs no netfilter rules in the pod, and dns+nft IS an
+	// in-pod nftables policy. Given both, this used to announce that it was not
+	// installing the DNS redirect and then apply the nftables policy anyway, which under
+	// a sandboxed kernel fails exactly the way external enforcement exists to avoid.
+	if constants.EnforcementIsExternal() && constants.ModeUsesNft(mode) {
+		log.Fatalf("%s=%s installs no netfilter rules in the pod, but %s=%s is an in-pod nftables policy; use %s=%s with external enforcement",
+			constants.EnvEnforcement, constants.EnforcementExternal,
+			constants.EnvEgressMode, mode,
+			constants.EnvEgressMode, constants.PolicyDnsOnly)
+	}
 
 	// upstreamSpec was already validated at startup; it scopes the infra nft
 	// exception and lets DNS exempt the proxy hostname from sandbox policy
@@ -155,14 +173,25 @@ func main() {
 		log.Infof("denied hostname webhook enabled")
 	}
 
-	exemptDst := dnsproxy.ParseNameserverExemptList()
-	if len(exemptDst) > 0 {
-		log.Infof("nameserver exempt list: %v (proxy upstream in this list will not set SO_MARK)", exemptDst)
+	// With enforcement outside the pod there is nothing to install and nothing to
+	// bypass, so the exempt list and the SO_MARK it controls are both moot. Attempting
+	// the setup here is not merely useless — it is fatal, since netfilter is
+	// unavailable to an unprivileged process in a sandboxed kernel. The DNS filter then
+	// sees no sandbox traffic: it listens on 15353, and no resolver setting can name a
+	// port.
+	var exemptDst []netip.Addr
+	if constants.EnforcementIsExternal() {
+		log.Infof("enforcement=external: not installing the DNS redirect; the sandbox's egress is enforced outside the pod")
+	} else {
+		exemptDst = dnsproxy.ParseNameserverExemptList()
+		if len(exemptDst) > 0 {
+			log.Infof("nameserver exempt list: %v (proxy upstream in this list will not set SO_MARK)", exemptDst)
+		}
+		if err := setupDNSRedirect(15353, exemptDst); err != nil {
+			log.Fatalf("failed to install iptables redirect: %v", err)
+		}
+		log.Infof("iptables redirect configured (OUTPUT 53 -> 15353) with SO_MARK bypass for proxy upstream traffic")
 	}
-	if err := iptables.SetupRedirect(15353, exemptDst); err != nil {
-		log.Fatalf("failed to install iptables redirect: %v", err)
-	}
-	log.Infof("iptables redirect configured (OUTPUT 53 -> 15353) with SO_MARK bypass for proxy upstream traffic")
 
 	setupNft(ctx, nftMgr, initialRules, proxy, allowIPs, alwaysDeny, alwaysAllow)
 
