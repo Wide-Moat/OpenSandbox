@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
-	"github.com/alibaba/opensandbox/egress/pkg/iptables"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/revision"
@@ -335,6 +334,18 @@ func (m *mitmTransparent) startInitial(ctx context.Context, deps mitmLaunchDepen
 	}
 }
 
+// The launcher's calls into the image and the process table, as variables so a test can
+// run startMitmproxyTransparentIfEnabled off the image and see what it decided: which
+// mode mitmdump is told (WM-1: regular under external enforcement) and whether the HTTP
+// redirect is installed. Each half of that decision has been deleted by a mutation with
+// every other test still green. The launch and listen boundary is upstream's own
+// mitmLaunchDependencies, reached through startupLaunchDependencies.
+var (
+	lookupMitmproxyUser       = mitmproxy.LookupUser
+	exportMitmCA              = mitmproxy.SyncRootCA
+	startupLaunchDependencies = defaultMitmLaunchDependencies
+)
+
 // startMitmproxyTransparentIfEnabled starts mitmdump in transparent mode, waits for the listener, and installs OUTPUT REDIRECT, then syncs the CA.
 func startMitmproxyTransparentIfEnabled(
 	ctx context.Context,
@@ -345,7 +356,7 @@ func startMitmproxyTransparentIfEnabled(
 	}
 
 	mpPort := constants.EnvIntOrDefault(constants.EnvMitmproxyPort, constants.DefaultMitmproxyPort)
-	mpUID, _, mpHome, err := mitmproxy.LookupUser(mitmproxy.RunAsUser)
+	mpUID, _, mpHome, err := lookupMitmproxyUser(mitmproxy.RunAsUser)
 	if err != nil {
 		return nil, fmt.Errorf("lookup user %q: %w (ensure this user exists in the image)", mitmproxy.RunAsUser, err)
 	}
@@ -355,11 +366,12 @@ func startMitmproxyTransparentIfEnabled(
 		return nil, fmt.Errorf("%s: %w", constants.EnvMitmproxyExtraPorts, err)
 	}
 
-	cfg := mitmproxy.Config{
+	cfg := mitmproxy.ConfigFromEnv(mitmproxy.Config{
 		ListenPort:  mpPort,
 		UserName:    mitmproxy.RunAsUser,
 		ScriptPaths: parseScriptPaths(os.Getenv(constants.EnvMitmproxyScript)),
-	}
+	})
+	external := cfg.Regular
 	revisionOwner, err := newSidecarRevisionLaunchOwner(policyServer)
 	if err != nil {
 		return nil, fmt.Errorf("configure revision runtime: %w", err)
@@ -368,12 +380,11 @@ func startMitmproxyTransparentIfEnabled(
 		port: mpPort, uid: mpUID, dports: dports, cfg: cfg, revisionOwner: revisionOwner,
 		restartCh: make(chan exitEvent, 64), shutdownCh: make(chan struct{}), watchDone: make(chan struct{}),
 	}
-	err = m.startInitial(ctx, defaultMitmLaunchDependencies(), func() error {
-		if err := iptables.SetupTransparentHTTP(mpPort, mpUID, dports); err != nil {
-			return fmt.Errorf("iptables transparent: %w", err)
+	err = m.startInitial(ctx, startupLaunchDependencies(), func() error {
+		if err := installHTTPRedirect(external, mpPort, mpUID, dports); err != nil {
+			return err
 		}
-		log.Infof("mitmproxy: transparent intercept active (OUTPUT tcp %s -> %d; trust mitm CA in clients)", dports, mpPort)
-		if err := mitmproxy.SyncRootCA("", mpHome); err != nil {
+		if err := exportMitmCA("", mpHome); err != nil {
 			return fmt.Errorf("mitm CA export: %w", err)
 		}
 		return nil

@@ -98,6 +98,12 @@ type Config struct {
 	// private socket parent and must not reuse this configuration after the
 	// child exits. Nil keeps the receiver disabled and removes inherited values.
 	RevisionIPC *RevisionIPCConfig
+	// Regular runs mitmdump as an ordinary forward proxy instead of transparent mode.
+	// Clients then reach it through HTTPS_PROXY and the real destination arrives in
+	// CONNECT, rather than being recovered from SO_ORIGINAL_DST after a redirect. Set
+	// when egress enforcement lives outside the pod, where no redirect exists to be
+	// transparent about. Applied as the --mode spec (see buildMitmdumpArgs).
+	Regular bool
 }
 
 // RevisionIPCConfig is handed only to the mitmdump child. The bearer token is
@@ -217,6 +223,16 @@ func loopbackV6Available() *bool {
 	return &ok
 }
 
+// ConfigFromEnv fills in the parts of Config that are decided by the environment
+// rather than by the caller, and returns the result.
+//
+// One place makes the decision, so the launcher and anything that has to reason about
+// what mitmdump will be told cannot disagree about it.
+func ConfigFromEnv(cfg Config) Config {
+	cfg.Regular = constants.EnforcementIsExternal()
+	return cfg
+}
+
 func buildMitmdumpArgs(cfg Config) []string {
 	// Explicit mode specs replace config.yaml's `mode: [transparent]` + `listen_host`: the ip6
 	// OUTPUT REDIRECT delivers to [::1]:<port>, which an IPv4 loopback listener never sees. Both
@@ -226,10 +242,17 @@ func buildMitmdumpArgs(cfg Config) []string {
 	if h := strings.TrimSpace(cfg.ListenHost); h != "" {
 		host = h
 	}
-	args := []string{
-		"--mode", fmt.Sprintf("transparent@%s:%d", host, cfg.ListenPort),
+	// WM-1: with enforcement=external there is no redirect, so the spec is `regular@…`,
+	// and no second transparent spec for [::1] -- that listener would wait for
+	// redirected connections that never come.
+	mode := "transparent"
+	if cfg.Regular {
+		mode = "regular"
 	}
-	if host == listenHostLoopback && cfg.ListenV6 != nil && *cfg.ListenV6 {
+	args := []string{
+		"--mode", fmt.Sprintf("%s@%s:%d", mode, host, cfg.ListenPort),
+	}
+	if !cfg.Regular && host == listenHostLoopback && cfg.ListenV6 != nil && *cfg.ListenV6 {
 		args = append(args, "--mode", fmt.Sprintf("transparent@%s:%d", listenHostLoopbackV6, cfg.ListenPort))
 	}
 	args = append(args,

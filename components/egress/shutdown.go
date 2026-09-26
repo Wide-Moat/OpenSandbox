@@ -22,9 +22,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/dnsproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/events"
-	"github.com/alibaba/opensandbox/egress/pkg/iptables"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 )
 
@@ -64,10 +64,17 @@ func waitForShutdown(ctx context.Context, proxy *dnsproxy.Proxy, policySrv *http
 	}
 
 	if mitm != nil {
-		iptables.RemoveTransparentHTTP(mitm.port, mitm.uid, mitm.dports)
+		if !constants.EnforcementIsExternal() {
+			removeHTTPRedirect(mitm.port, mitm.uid, mitm.dports)
+		}
 		mitm.shutdown(defaultMitmShutdownTimeout)
 	}
-	iptables.RemoveRedirect(15353, exemptDst)
+	// Symmetric with startup: nothing was installed under external enforcement, so
+	// there is nothing to remove — and the attempt would fail the same way the setup
+	// would, on a netfilter subsystem that is not there.
+	if !constants.EnforcementIsExternal() {
+		removeDNSRedirect(15353, exemptDst)
+	}
 
 	if applier != nil {
 		nftCtx, nftCancel := context.WithTimeout(context.Background(), defaultNftTeardownTimeout)
