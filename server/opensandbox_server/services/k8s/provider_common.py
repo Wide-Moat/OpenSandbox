@@ -18,10 +18,13 @@ from typing import Any, Callable, Dict, Optional
 
 from fastapi import HTTPException, status
 from kubernetes.client import (
+    ApiClient,
     V1AppArmorProfile,
     V1Capabilities,
     V1Container,
     V1EnvVar,
+    V1HTTPGetAction,
+    V1Probe,
     V1ResourceRequirements,
     V1SeccompProfile,
     V1SecurityContext,
@@ -30,7 +33,7 @@ from kubernetes.client import (
 
 from opensandbox_server.api.schema import ImageSpec
 from opensandbox_server.extensions.keys import ISOLATION_UPPER_MOUNT_PATH
-from opensandbox_server.services.constants import SandboxErrorCodes
+from opensandbox_server.services.constants import EXECD_PORT, SandboxErrorCodes
 from opensandbox_server.services.helpers import parse_gpu_request
 from opensandbox_server.services.k8s.egress_helper import (
     build_security_context_for_sandbox_container,
@@ -43,6 +46,47 @@ from opensandbox_server.services.k8s.security_context import (
 
 # Default entrypoint auto-filled by the SDK when user does not provide one.
 DEFAULT_ENTRYPOINT = ["tail", "-f", "/dev/null"]
+
+# WM-10. ⚠ WITHOUT THESE PROBES A SANDBOX IS "READY" BEFORE IT CAN RUN ANYTHING.
+#
+# The create path returns to the caller once the workload reports Running, and Running
+# for a BatchSandbox means PodsReady. With no probe the kubelet has nothing to ask, so
+# the pod is Ready the moment the container process starts -- before execd listens --
+# and the caller gets an id for a sandbox that refuses the next request.
+#
+# Two probes, because one cannot be both fast and cheap. The STARTUP probe asks every
+# second, so the pod turns Ready within a second of execd answering; it stops once it
+# has succeeded. The READINESS probe then takes over -- the kubelet runs it straight
+# away rather than a period later -- and asks every 10 s for the pod's whole life, so a
+# Ready pod whose execd dies turns NotReady within about 30 s. Every probe is a request
+# execd logs at info; a 1 s readiness probe was 86,400 log lines a day per sandbox.
+#
+# The startup probe's threshold is the one thing here that acts: past it the kubelet
+# restarts the container. It is set far beyond the server's own create timeout (60 s by
+# default), so it never decides a create; it only stops a pod whose execd never came up
+# from waiting for it forever.
+#
+# /ping, not execd's /ready. /ready exists only from upstream 57ea7951 on, and the
+# server is rolled out before execd: against an older execd it answers 404 and no pod
+# would ever become Ready. /ping answers once execd listens, which can be before a
+# lifecycle preStart has finished; move to /ready once the execd image is pinned at or
+# after that commit.
+EXECD_STARTUP_PROBE_FAILURE_THRESHOLD = 600
+
+
+def _execd_ping_probe(*, period_seconds: int, failure_threshold: int) -> V1Probe:
+    return V1Probe(
+        http_get=V1HTTPGetAction(path="/ping", port=EXECD_PORT),
+        period_seconds=period_seconds,
+        failure_threshold=failure_threshold,
+    )
+
+
+# Serialises the probes. _container_to_dict writes every other field by hand; a probe
+# written that way carries only the fields someone remembered to name, and the rest
+# (timeoutSeconds, exec, tcpSocket, ...) would vanish without a word. The client's own
+# serialiser writes whatever the V1Probe holds.
+_K8S_SERIALISER = ApiClient()
 
 _GPU_RESOURCE_LIMIT_KEY = "gpu"
 # Canonical extended-resource name advertised by the NVIDIA device plugin.
@@ -229,6 +273,10 @@ def _build_main_container(
         resources=resources,
         volume_mounts=volume_mounts,
         security_context=security_context,
+        startup_probe=_execd_ping_probe(
+            period_seconds=1, failure_threshold=EXECD_STARTUP_PROBE_FAILURE_THRESHOLD
+        ),
+        readiness_probe=_execd_ping_probe(period_seconds=10, failure_threshold=3),
     )
 
 
@@ -256,6 +304,15 @@ def _container_to_dict(container: V1Container) -> Dict[str, Any]:
             {"name": vm.name, "mountPath": vm.mount_path}
             for vm in container.volume_mounts
         ]
+    # WM-10: the probes are written by the client's serialiser, see _K8S_SERIALISER.
+    if container.startup_probe is not None:
+        result["startupProbe"] = _K8S_SERIALISER.sanitize_for_serialization(
+            container.startup_probe
+        )
+    if container.readiness_probe is not None:
+        result["readinessProbe"] = _K8S_SERIALISER.sanitize_for_serialization(
+            container.readiness_probe
+        )
     if container.security_context:
         security_context_dict = serialize_security_context_to_dict(container.security_context)
         if security_context_dict:
