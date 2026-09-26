@@ -25,6 +25,8 @@ SANDBOX_MANUAL_CLEANUP_LABEL = "opensandbox.io/manual-cleanup"
 SANDBOX_PLATFORM_OS_LABEL = "opensandbox.io/platform-os"
 SANDBOX_PLATFORM_ARCH_LABEL = "opensandbox.io/platform-arch"
 SANDBOX_SNAPSHOT_ID_LABEL = "opensandbox.io/snapshot-id"
+# The port execd listens on inside every sandbox.
+EXECD_PORT = 44772
 # Host-mapped ports recorded on containers (bridge mode).
 SANDBOX_EMBEDDING_PROXY_PORT_LABEL = (
     "opensandbox.io/embedding-proxy-port"  # maps container 44772 -> host port
@@ -188,6 +190,7 @@ class SnapshotErrorCodes:
 
 
 __all__ = [
+    "EXECD_PORT",
     "RESERVED_LABEL_PREFIX",
     "SANDBOX_ID_LABEL",
     "SANDBOX_TENANT_LABEL",
