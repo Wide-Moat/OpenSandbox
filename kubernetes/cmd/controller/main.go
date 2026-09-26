@@ -33,6 +33,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -164,6 +165,9 @@ func main() {
 
 	// Controller concurrency options
 	var concurrencyConfig ConcurrencyConfig
+
+	// Namespaces to watch. Empty is cluster-wide, which is the default and unchanged.
+	scopeCache := registerWatchNamespacesFlag(flag.CommandLine)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -406,7 +410,7 @@ func main() {
 		config.Burst = kubeClientBurst
 	}
 
-	mgr, err := ctrl.NewManager(config, ctrl.Options{
+	mgr, err := ctrl.NewManager(config, scopeCache(ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -418,7 +422,7 @@ func main() {
 		// for the full LeaseDuration. This is safe because main() exits immediately after
 		// mgr.Start() returns and performs no post-stop cleanup.
 		LeaderElectionReleaseOnCancel: true,
-	})
+	}))
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -535,4 +539,48 @@ func loadImageCommitterPodTemplate(path string) (*corev1.PodTemplateSpec, error)
 		return nil, fmt.Errorf("parse Pod template: %w", err)
 	}
 	return &template, nil
+}
+
+// registerWatchNamespacesFlag registers --watch-namespaces on fs and returns what
+// applies its value to the manager options. main registers it with its other flags and
+// wraps the options it hands ctrl.NewManager in it -- an argument, so there is no
+// separate statement to drop or to move past the call. TestWM6TheFlagIsAppliedAtStartup
+// sees the built controller apply it; the unit tests see what it applies.
+func registerWatchNamespacesFlag(fs *flag.FlagSet) func(ctrl.Options) ctrl.Options {
+	var watchNamespaces string
+	fs.StringVar(&watchNamespaces, "watch-namespaces", "",
+		"Comma-separated namespaces to watch. Empty (the default) watches the whole "+
+			"cluster, which is unchanged behavior. Set it to run more than one "+
+			"installation in a single cluster: the manager cache is otherwise "+
+			"cluster-wide, so a second installation's controller reconciles the first's "+
+			"objects and the two contend for the same pool pods.")
+	return func(options ctrl.Options) ctrl.Options {
+		applyWatchNamespaces(&options, watchNamespaces)
+		if len(options.Cache.DefaultNamespaces) > 0 {
+			setupLog.Info("watching namespaces", "namespaces", watchNamespaces)
+		}
+		return options
+	}
+}
+
+// applyWatchNamespaces restricts the manager's cache to the given comma-separated
+// namespaces. An empty or blank list leaves the options untouched, which is a
+// cluster-wide cache -- the default, and what every existing deployment gets.
+//
+// Why this is worth having: the cache is cluster-wide, but leader election is not.
+// The lease lives in the controller's own namespace, so it coordinates REPLICAS of one
+// installation and knows nothing about a second one. Two installations in a single
+// cluster therefore both elect a leader, both watch everything, and both act on each
+// other's BatchSandboxes and Pool pods -- each taking pods the other just created.
+func applyWatchNamespaces(options *ctrl.Options, watchNamespaces string) {
+	namespaces := map[string]cache.Config{}
+	for _, ns := range strings.Split(watchNamespaces, ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			namespaces[ns] = cache.Config{}
+		}
+	}
+	if len(namespaces) == 0 {
+		return
+	}
+	options.Cache.DefaultNamespaces = namespaces
 }

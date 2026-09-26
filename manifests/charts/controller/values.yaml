@@ -36,6 +36,13 @@ controller:
   
   # -- Log level for zap logger (debug, info, error)
   logLevel: info
+  # -- Namespaces this controller watches, passed as `--watch-namespaces`. Empty (the
+  # default) watches the whole cluster. Set it when more than one installation shares a
+  # cluster: the manager cache is otherwise cluster-wide while leader election is not --
+  # the lease lives in the release namespace, so it coordinates replicas of ONE
+  # installation and knows nothing about a second. Both then act on each other's
+  # BatchSandboxes and contend for the same pool pods.
+  watchNamespaces: []
 
   # -- controller-runtime metrics endpoint (Prometheus). Disabled by default to
   # preserve the current behavior (the binary defaults to `--metrics-bind-address=0`).

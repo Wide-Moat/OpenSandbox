@@ -94,6 +94,7 @@ The following table lists the configurable parameters of the chart and their def
 | controller.snapshot.resumePullSecret | string | `""` | Secret name injected into resumed sandboxes for pulling snapshot images. |
 | controller.snapshot.snapshotPushSecret | string | `""` | Secret name used by commit Jobs to push snapshot images. |
 | controller.tolerations | list | `[]` | Tolerations for controller pod assignment |
+| controller.watchNamespaces | list | `[]` | Namespaces this controller watches, passed as `--watch-namespaces`. Empty (the default) watches the whole cluster. Set it when more than one installation shares a cluster: the manager cache is otherwise cluster-wide while leader election is not -- the lease lives in the release namespace, so it coordinates replicas of ONE installation and knows nothing about a second. Both then act on each other's BatchSandboxes and contend for the same pool pods. |
 | extraContainers | list | `[]` | Additional sidecar containers |
 | extraEnv | list | `[]` | Additional environment variables for the controller |
 | extraInitContainers | list | `[]` | Additional init containers |
