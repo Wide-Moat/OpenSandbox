@@ -23,6 +23,7 @@ from typing import Callable, Dict, List, Any, Optional
 
 from opensandbox_server.api.schema import Endpoint, ImageSpec, NetworkPolicy, PlatformSpec, Volume
 from opensandbox_server.config import EgressUpstreamProxyConfig
+from opensandbox_server.config import EGRESS_ENFORCEMENT_SIDECAR
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,10 @@ class EgressWorkloadSettings:
     resource_limits: Optional[Dict[str, str]]
     otlp_endpoint: Optional[str] = None
     upstream_proxy: Optional[EgressUpstreamProxyConfig] = None
+    # Where egress is enforced. Defaults to "sidecar", which is unchanged behaviour;
+    # see EgressConfig.enforcement. Server-side only — never request-derived, unlike
+    # `env` above, because a request able to set it could unfilter its own sandbox.
+    enforcement: str = EGRESS_ENFORCEMENT_SIDECAR
 
 
 class WorkloadProvider(ABC):

@@ -224,3 +224,105 @@ async def test_validate_startup_no_warn_kata_with_egress() -> None:
         await validate_secure_runtime_on_startup(config, k8s_client=k8s_client)
 
     mock_logger.warning.assert_not_called()
+
+
+def _egress_with_enforcement(enforcement: str) -> EgressConfig:
+    """Build an egress config carrying ``[egress] enforcement``, when the field exists.
+
+    The key is written as a literal string and filtered against ``model_fields`` rather
+    than passed as a keyword, for the reason the sibling checks in ``test_validators.py``
+    give: naming a field that an unmodified tree does not have makes the test fail to
+    CONSTRUCT, which proves only that a field is missing and goes green the moment one
+    exists with nothing behind it. Filtered, the unmodified tree builds a valid config,
+    reaches the warning, and fails on what was LOGGED.
+    """
+    # disable_ipv6 off, as external enforcement requires it to be (see EgressConfig).
+    fields = {
+        "image": "opensandbox/egress:latest",
+        "enforcement": enforcement,
+        "disable_ipv6": False,
+    }
+    return EgressConfig(**{k: v for k, v in fields.items() if k in EgressConfig.model_fields})
+
+
+@pytest.mark.asyncio
+async def test_wm2_no_warn_gvisor_with_external_enforcement() -> None:
+    """The warning promises a rejection that external enforcement does not perform.
+
+    Both validators -- ``ensure_credential_proxy_configured`` and
+    ``ensure_egress_runtime_compatible`` -- return early under
+    ``[egress] enforcement = "external"``, so no sandbox is rejected at creation time.
+    A warning saying otherwise is false, and a false warning about a security control
+    is worse than none: it is read as a reason to change a configuration that is right.
+    """
+    k8s_client = MagicMock()
+    config = _config(
+        runtime_type="kubernetes",
+        secure_runtime=SecureRuntimeConfig(type="gvisor", k8s_runtime_class="gvisor"),
+        egress=_egress_with_enforcement("external"),
+    )
+
+    with unittest.mock.patch(
+        "opensandbox_server.services.runtime_resolver.logger"
+    ) as mock_logger:
+        await validate_secure_runtime_on_startup(config, k8s_client=k8s_client)
+
+    warned = [
+        call for call in mock_logger.warning.call_args_list if "iptables nat" in str(call)
+    ]
+    assert warned == [], f"warned about a rejection that will not happen: {warned}"
+
+
+@pytest.mark.asyncio
+async def test_wm2_still_warns_gvisor_with_sidecar_enforcement() -> None:
+    """The guard: the default is unchanged.
+
+    Without this, deleting the warning outright would pass the test above while
+    removing a true warning for every deployment that does enforce in the sidecar --
+    where the rejection the message describes really does happen.
+    """
+    k8s_client = MagicMock()
+    config = _config(
+        runtime_type="kubernetes",
+        secure_runtime=SecureRuntimeConfig(type="gvisor", k8s_runtime_class="gvisor"),
+        egress=_egress_with_enforcement("sidecar"),
+    )
+
+    with unittest.mock.patch(
+        "opensandbox_server.services.runtime_resolver.logger"
+    ) as mock_logger:
+        await validate_secure_runtime_on_startup(config, k8s_client=k8s_client)
+
+    warned = [
+        call for call in mock_logger.warning.call_args_list if "iptables nat" in str(call)
+    ]
+    assert len(warned) == 1, f"expected the gVisor/egress warning, got: {mock_logger.warning.call_args_list}"
+
+
+@pytest.mark.asyncio
+async def test_wm2_docker_still_warns_gvisor_under_external_enforcement() -> None:
+    """The warning is suppressed on Kubernetes only.
+
+    The Docker runtime never tells its sidecar that enforcement is external: it judges
+    every create as sidecar enforcement and still rejects gVisor with a network_policy
+    (``DockerNetworkingMixin._ensure_network_policy_support``). There the warning's
+    prediction is true whatever ``[egress] enforcement`` says, and hiding it would leave
+    the rejection unannounced.
+    """
+    docker_client = MagicMock()
+    docker_client.info.return_value = {"Runtimes": {"runsc": {"path": "/usr/bin/runsc"}}}
+    config = _config(
+        runtime_type="docker",
+        secure_runtime=SecureRuntimeConfig(type="gvisor", docker_runtime="runsc"),
+        egress=_egress_with_enforcement("external"),
+    )
+
+    with unittest.mock.patch(
+        "opensandbox_server.services.runtime_resolver.logger"
+    ) as mock_logger:
+        await validate_secure_runtime_on_startup(config, docker_client=docker_client)
+
+    warned = [
+        call for call in mock_logger.warning.call_args_list if "iptables nat" in str(call)
+    ]
+    assert len(warned) == 1, f"expected the gVisor/egress warning, got: {mock_logger.warning.call_args_list}"

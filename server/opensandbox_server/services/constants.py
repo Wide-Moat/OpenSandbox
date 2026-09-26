@@ -72,6 +72,11 @@ OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_REQUIRE_SCOPED_MATCH = (
 # Must match components/egress/pkg/constants/configuration.go EnvUpstreamProxy{,Auth}.
 OPENSANDBOX_EGRESS_UPSTREAM_PROXY = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY"
 OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH"
+# Where enforcement lives. Server-side only, and deliberately NOT in
+# ALLOWED_EGRESS_ENV_VARS below: it is a property of the cluster, and a request able
+# to set it could tell the sidecar to install nothing and so unfilter its own sandbox.
+# Must match components/egress/pkg/constants/configuration.go EnvEnforcement.
+OPENSANDBOX_EGRESS_ENFORCEMENT = "OPENSANDBOX_EGRESS_ENFORCEMENT"
 ALLOWED_EGRESS_ENV_VARS = frozenset({
     "OPENSANDBOX_EGRESS_LOG_LEVEL",
     "OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT",
@@ -210,6 +215,7 @@ __all__ = [
     "OPENSANDBOX_EGRESS_UPSTREAM_PROXY",
     "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH",
     "ALLOWED_EGRESS_ENV_VARS",
+    "OPENSANDBOX_EGRESS_ENFORCEMENT",
     "OPENSANDBOX_RUNTIME_VOLUME_NAME",
     "OPENSANDBOX_RUNTIME_MOUNT_PATH",
     "OPENSANDBOX_LIFECYCLE",
