@@ -861,3 +861,89 @@ class TestSplitEgressEnv:
         env = {key: "val" for key in ALLOWED_EGRESS_ENV_VARS}
         sandbox_env, egress_env = split_egress_env(env)
         assert set(egress_env.keys()) == ALLOWED_EGRESS_ENV_VARS
+
+
+# WM-8: credentialProxy.seed is rendered into the egress sidecar's own environment, and
+# nowhere the sandbox container can read. Why, and why at all: NOTICE-WIDE-MOAT.md, WM-8.
+# These tests hand apply_egress_to_spec its settings; k8s/test_create_path_egress.py
+# covers the same from the create request.
+#
+# Both helpers below exist for `hack/wm-fail-on-base.sh`, which copies these tests into an
+# unmodified upstream tree and requires them to FAIL there on the answer, not on a missing
+# symbol (a compile error goes green the moment the symbol exists with nothing behind it).
+
+
+# ⚠ SET REFLECTIVELY, NEVER AS A KEYWORD: the gate reads "unexpected keyword" as a build
+# break. Assigned afterwards it builds on either tree, and upstream never renders it.
+def _with_wm8_seed(settings, seed):
+    if seed is not None:
+        object.__setattr__(settings, "credential_vault_seed", seed)
+    return settings
+
+
+# ⚠ THE LITERAL NAME, NOT THE IMPORTED CONSTANT, so the test imports on a tree that has
+# never heard of it.
+_WM8_SEED_ENV = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED"
+
+_WM8_SEED = {
+    "credentials": [{"name": "k", "source": {"type": "inline", "value": "s3cret-value"}}],
+    "bindings": [
+        {
+            "name": "b",
+            "match": {"hosts": ["files.example.com"]},
+            "auth": {"type": "bearer", "credential": "k"},
+        }
+    ],
+}
+
+
+def _wm8_sidecar_env(seed):
+    policy = NetworkPolicy(
+        defaultAction="deny",
+        egress=[NetworkRule(action="allow", target="files.example.com")],
+    )
+    containers: list = []
+    apply_egress_to_spec(
+        containers,
+        _with_wm8_seed(_egress_settings(policy, credential_proxy_enabled=True), seed),
+        "sbx-1",
+    )
+    sidecar = next(c for c in containers if c["name"] == "egress")
+    return {e["name"]: e["value"] for e in sidecar["env"]}
+
+
+def test_wm8_seed_travels_in_the_sidecar_environment():
+    env = _wm8_sidecar_env(_WM8_SEED)
+    assert _WM8_SEED_ENV in env
+    assert json.loads(env[_WM8_SEED_ENV]) == _WM8_SEED
+
+
+def test_wm8_no_seed_is_the_default():
+    env = _wm8_sidecar_env(None)
+    assert _WM8_SEED_ENV not in env
+
+
+def test_wm8_the_secret_reaches_the_sidecar_and_nothing_else():
+    """The sandbox container must not be able to read it."""
+    policy = NetworkPolicy(
+        defaultAction="deny",
+        egress=[NetworkRule(action="allow", target="files.example.com")],
+    )
+    containers: list = [{"name": "sandbox", "env": [{"name": "HOME", "value": "/home/user"}]}]
+    apply_egress_to_spec(
+        containers,
+        _with_wm8_seed(_egress_settings(policy, credential_proxy_enabled=True), _WM8_SEED),
+        "sbx-1",
+    )
+    sidecar = next(c for c in containers if c["name"] == "egress")
+    sandbox = next(c for c in containers if c["name"] == "sandbox")
+
+    # The half that fails on a tree with no seeding: it must actually be delivered.
+    sidecar_env = {e["name"]: e["value"] for e in sidecar["env"]}
+    assert _WM8_SEED_ENV in sidecar_env
+    assert "s3cret-value" in sidecar_env[_WM8_SEED_ENV]
+
+    # And the half that is the security property: nowhere the sandbox can read it.
+    rendered = json.dumps(sandbox)
+    assert "s3cret-value" not in rendered
+    assert _WM8_SEED_ENV not in rendered

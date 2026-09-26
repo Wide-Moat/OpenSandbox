@@ -1249,6 +1249,80 @@ async def test_create_sandbox_network_policy_enables_mitm_only_for_credential_pr
 
 @pytest.mark.asyncio
 @patch("opensandbox_server.services.docker.docker_service.docker")
+async def test_wm8_docker_seed_reaches_the_sidecar_and_not_the_sandbox(mock_docker):
+    """credentialProxy.seed goes into the egress sidecar's environment only.
+
+    Driven through create_sandbox, because the two containers get their environments
+    in different places: the sidecar's in _start_egress_sidecar, the sandbox's in
+    _provision_sandbox. The seed once landed in the second -- readable by the sandbox,
+    and never seen by the sidecar, so the vault was not seeded either.
+    """
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+    mock_client.api.create_host_config.side_effect = lambda **kwargs: kwargs
+    mock_client.api.create_container.side_effect = [
+        {"Id": "sidecar-id"},
+        {"Id": "main-id"},
+    ]
+    mock_client.containers.get.side_effect = [MagicMock(id="sidecar-id"), MagicMock(id="main-id")]
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.egress = EgressConfig(image="egress:latest", mode="dns+nft")
+    service = DockerSandboxService(config=cfg)
+
+    seed = {
+        "credentials": [{"name": "k", "source": {"type": "inline", "value": "s3cret-value"}}],
+        "bindings": [],
+    }
+    req = CreateSandboxRequest(
+        image=ImageSpec(uri="python:3.11"),
+        timeout=120,
+        resourceLimits=ResourceLimits(root={}),
+        env={},
+        metadata={},
+        entrypoint=["python"],
+        networkPolicy=NetworkPolicy(default_action="deny", egress=[]),
+        # A keyword, not an attribute set afterwards: pydantic ignores an unknown field,
+        # so on a tree without the seed this still builds and fails on the answer.
+        credentialProxy=CredentialProxyConfig(enabled=True, seed=seed),
+    )
+
+    with (
+        patch("opensandbox_server.services.docker.docker_service.generate_egress_token", return_value="egress-token"),
+        patch(
+            "opensandbox_server.services.docker.docker_service.allocate_port_bindings",
+            return_value={
+                "44772": ("0.0.0.0", 44772),
+                "8080": ("0.0.0.0", 8080),
+                "18080": ("0.0.0.0", 18080),
+            },
+        ),
+        patch.object(service, "_ensure_image_available"),
+        patch.object(service, "_prepare_sandbox_runtime"),
+        patch.object(service, "_wait_for_egress_sidecar_ready"),
+    ):
+        await service.create_sandbox(req)
+
+    sidecar_kwargs = mock_client.api.create_container.call_args_list[0].kwargs
+    main_kwargs = mock_client.api.create_container.call_args_list[1].kwargs
+    assert sidecar_kwargs["labels"].get("opensandbox.io/egress-sidecar-for"), (
+        "the first container created must be the egress sidecar"
+    )
+
+    seed_name = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED"
+    sidecar_seed = [e for e in sidecar_kwargs["environment"] if e.startswith(f"{seed_name}=")]
+    assert len(sidecar_seed) == 1, f"the sidecar was not given the seed: {sidecar_kwargs['environment']}"
+    assert json.loads(sidecar_seed[0].split("=", 1)[1]) == seed
+
+    rendered_main = json.dumps(main_kwargs, default=str)
+    assert "s3cret-value" not in rendered_main, "the sandbox container can read the credential"
+    assert seed_name not in rendered_main
+
+
+@pytest.mark.asyncio
+@patch("opensandbox_server.services.docker.docker_service.docker")
 async def test_create_sandbox_rejects_secure_access_on_docker_runtime(mock_docker):
     mock_client = MagicMock()
     mock_client.containers.list.return_value = []

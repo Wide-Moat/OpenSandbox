@@ -31,6 +31,7 @@ from opensandbox_server.services.constants import (
     SANDBOX_SNAPSHOT_ID_LABEL,
 )
 from opensandbox_server.services.helpers import (
+    credential_vault_seed,
     split_egress_env,
     validate_upstream_proxy_request,
 )
@@ -132,6 +133,7 @@ def _build_create_workload_context(
             mode=egress_config.mode,
             auth_token=egress_auth_token,
             credential_proxy_enabled=credential_proxy_enabled,
+            credential_vault_seed=credential_vault_seed(request),
             env=egress_env,
             disable_ipv6=egress_config.disable_ipv6,
             resource_requests=egress_config.requests,

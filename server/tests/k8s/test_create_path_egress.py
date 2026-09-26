@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WM-2 from the configuration to the submitted pod.
+"""WM-2 and WM-8 from the configuration and the request to the submitted pod.
 
 The unit tests hand each piece its input directly: ``apply_egress_to_spec`` a settings
 object, each validator an ``egress_config``. Nothing there notices when the wiring
@@ -22,17 +22,18 @@ These tests go through ``create_sandbox`` with a real provider rendering into a 
 cluster, and read the workload it submits.
 
 Every configuration value here is passed by keyword to a pydantic model, which ignores
-a field it does not know. On a tree without WM-2 the tests therefore build and
+a field it does not know. On a tree without WM-2 or WM-8 the tests therefore build and
 fail on the answer: the create is refused, or the pod lacks what it should carry.
 """
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-from opensandbox_server.api.schema import NetworkPolicy
+from opensandbox_server.api.schema import CredentialProxyConfig, NetworkPolicy, NetworkRule
 from opensandbox_server.config import EgressConfig, SecureRuntimeConfig
 from opensandbox_server.services.k8s.agent_sandbox_provider import AgentSandboxProvider
 from opensandbox_server.services.k8s.batchsandbox_provider import BatchSandboxProvider
@@ -40,6 +41,7 @@ from opensandbox_server.services.k8s.batchsandbox_provider import BatchSandboxPr
 # Literal names, not the imported constants: a tree without the change must still
 # import this file and fail on what the pod carries.
 _ENFORCEMENT_ENV = "OPENSANDBOX_EGRESS_ENFORCEMENT"
+_SEED_ENV = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED"
 
 
 def _gvisor_with_external_enforcement(service):
@@ -125,3 +127,33 @@ async def test_wm2_external_enforcement_reaches_the_agent_sandbox_pod(
     body = await _create(k8s_service, provider, create_sandbox_request)
 
     _assert_external_sidecar(body["spec"]["podTemplate"]["spec"])
+
+
+@pytest.mark.asyncio
+async def test_wm8_seed_reaches_the_sidecar_through_create(
+    k8s_service, create_sandbox_request, mock_k8s_client
+):
+    """credentialProxy.seed from the request ends up on the sidecar, and only there.
+
+    Sidecar enforcement with dns+nft, the credential proxy's own requirement, so this
+    exercises WM-8 alone.
+    """
+    k8s_service.app_config.egress = EgressConfig(image="opensandbox/egress:test", mode="dns+nft")
+    seed = {
+        "credentials": [{"name": "k", "source": {"type": "inline", "value": "s3cret-value"}}],
+        "bindings": [],
+    }
+    create_sandbox_request.network_policy = NetworkPolicy(
+        default_action="deny",
+        egress=[NetworkRule(action="allow", target="files.example.com")],
+    )
+    create_sandbox_request.credential_proxy = CredentialProxyConfig(enabled=True, seed=seed)
+    provider = BatchSandboxProvider(mock_k8s_client, k8s_service.app_config)
+
+    body = await _create(k8s_service, provider, create_sandbox_request)
+
+    sidecar, sandbox = _containers(body["spec"]["template"]["spec"])
+    sidecar_env = _env(sidecar)
+    assert _SEED_ENV in sidecar_env, f"the sidecar was not given the seed: {sorted(sidecar_env)}"
+    assert json.loads(sidecar_env[_SEED_ENV]) == seed
+    assert "s3cret-value" not in json.dumps(sandbox), "the sandbox container can read the credential"
