@@ -57,6 +57,9 @@ spec:
         {{- end }}
         - --health-probe-bind-address=:{{ $healthPort }}
         - --zap-log-level={{ .Values.controller.logLevel }}
+        {{- with .Values.controller.watchNamespaces }}
+        - --watch-namespaces={{ join "," . }}
+        {{- end }}
         {{- if $metrics.enabled }}
         - --metrics-bind-address=:{{ $metrics.port | default 8080 }}
         - --metrics-secure={{ $metrics.secure | default false }}
