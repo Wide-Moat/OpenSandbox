@@ -409,6 +409,8 @@ func TestTaskManager_GetEmptyName(t *testing.T) {
 func TestTaskManager_List(t *testing.T) {
 	mgr, _ := setupTestManager(t)
 	ctx := context.Background()
+	mgr.Start(ctx)
+	defer mgr.Stop()
 
 	// Initially empty
 	tasks, err := mgr.List(ctx)
@@ -431,7 +433,13 @@ func TestTaskManager_List(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
-	defer mgr.Delete(ctx, task.Name)
+	defer func() {
+		require.NoError(t, mgr.Delete(ctx, task.Name))
+		require.Eventually(t, func() bool {
+			remaining, err := mgr.List(ctx)
+			return err == nil && len(remaining) == 0
+		}, 5*time.Second, 10*time.Millisecond, "task must be finalized before TempDir cleanup")
+	}()
 
 	// List should return 1 task
 	tasks, err = mgr.List(ctx)
