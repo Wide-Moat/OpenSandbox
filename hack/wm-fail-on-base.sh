@@ -211,6 +211,13 @@ is_guard() {
     test_wm11_docker_shaped_endpoints_still_forward_what_stays_inside_the_port) return 0 ;;
     # In runtime-init mode execd serves /internal/init exactly as upstream does.
     TestWM12InternalInitIsStillServedInRuntimeInitMode) return 0 ;;
+    # WM-13 skips an unreadable configured namespace only when a tenant provider names
+    # others. Without one that namespace is the only one the server owns, and its error
+    # stays the answer after a single read, as upstream's does.
+    test_wm13_single_tenant_still_reports_the_configured_namespace_error) return 0 ;;
+    # A sandbox in no readable namespace is still a dropped renew that names the 403 of
+    # the configured namespace -- skipping that read must not make the failure quiet.
+    test_wm13_a_sandbox_in_no_readable_namespace_still_fails_with_the_403) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -508,7 +515,7 @@ copy components/egress/credential_vault_api_wait_test.go
 copy components/egress/cleanup_sleep_test.go
 copy kubernetes/cmd/controller/watch_namespaces_flag_test.go
 copy components/execd/pkg/web/internal_init_test.go
-# Python: WM-2, WM-4, WM-8, WM-10, WM-11.
+# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
 copy server/tests/test_runtime_resolver.py
@@ -518,6 +525,7 @@ copy server/tests/k8s/test_egress_helper.py
 copy server/tests/k8s/test_create_path_egress.py
 copy server/tests/k8s/test_sandbox_readiness_probe.py
 copy server/tests/test_proxy_execd_internal.py
+copy server/tests/k8s/test_renew_lookup_unreadable_fallback.py
 
 # Module and package of a Go test file, from the nearest go.mod above it.
 go_package() { # <path> -> "<module dir> <package>"
