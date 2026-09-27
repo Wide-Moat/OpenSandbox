@@ -209,9 +209,29 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         Used as fallback when ContextVar has no tenant context (background
         renew workers, proxy path). Returns the namespace or None.
         """
-        workload = self.workload_provider.get_workload(
-            sandbox_id=sandbox_id, namespace=self.namespace
-        )
+        try:
+            workload = self.workload_provider.get_workload(
+                sandbox_id=sandbox_id, namespace=self.namespace
+            )
+        except Exception:
+            # With a tenant provider the configured namespace is only a
+            # fallback, and a deployment may grant the server no access to it
+            # at all (RBAC scoped to the tenant namespaces, or a fallback that
+            # deliberately does not exist) -- the read is then a 403. That
+            # says nothing about where this sandbox is, so go on to the
+            # namespaces that may hold it, exactly as a failed read of one of
+            # them does below. If none resolves, the caller reads this
+            # namespace again and that error is the one reported.
+            if self._tenant_provider is None:
+                raise
+            logger.debug(
+                "sandbox %s: cannot read the configured namespace %s; "
+                "trying tenant namespaces",
+                sandbox_id,
+                self.namespace,
+                exc_info=True,
+            )
+            workload = None
         if workload:
             return self.namespace
 
