@@ -72,8 +72,8 @@ class _MemSandboxState:
 class RenewIntentConsumer:
     """
     Feeds renew work from Redis BRPOP (optional) and server-proxy ``schedule`` into one queue.
-    Per-sandbox ``asyncio.Lock`` serializes work; without Redis, ``min_interval`` throttles proxy
-    renews (ingress throttling is producer-side).
+    Per-sandbox ``asyncio.Lock`` serializes work; ``min_interval`` throttles proxy renews with or
+    without Redis (ingress throttling is producer-side, the proxy has no producer-side throttle).
     """
 
     def __init__(
@@ -292,7 +292,7 @@ class RenewIntentConsumer:
 
         st = self._ensure_mru_mem(work.sandbox_id)
         async with st.lock:
-            if self._redis is not None:
+            if work.source != RENEW_SOURCE_SERVER_PROXY:
                 await self._controller.renew_after_gates(
                     work.sandbox_id, source=work.source, namespace=work.namespace
                 )
