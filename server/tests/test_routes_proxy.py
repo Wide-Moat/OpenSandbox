@@ -1810,7 +1810,7 @@ async def test_strict_revocation_closes_real_loopback_backend(client, auth_heade
     from opensandbox_server.config import TenantsConfig
     from opensandbox_server.tenants.models import TenantEntry
     revoked = threading.Event()
-    closed = asyncio.Event()
+    closed = threading.Event()
     owner = TenantEntry(name='owner', namespace='stage', subject='owner')
     provider = SimpleNamespace(lookup=lambda key: owner, lookup_fresh=lambda key: None if revoked.is_set() else owner)
     monkeypatch.setattr(cast(Any, client.app).state, 'tenant_provider', provider, raising=False)
@@ -1833,8 +1833,14 @@ async def test_strict_revocation_closes_real_loopback_backend(client, auth_heade
                 with pytest.raises(WebSocketDisconnect) as denied:
                     ws.receive_text()
                 assert denied.value.code == 1008
-        await asyncio.wait_for(asyncio.to_thread(exercise), timeout=3)
-        await asyncio.wait_for(closed.wait(), timeout=3)
+                # Wait for the backend to see the close while the session is still
+                # open. Leaving the block sends a client disconnect, which closes the
+                # backend on its own, then cancels the app and stops its event loop --
+                # mid-handshake, under load, leaving the backend's TCP half-open until
+                # its 10s close timeout. Inside, only revocation can close it. The
+                # bounds only turn a hang into a failure; nothing races them.
+                assert closed.wait(timeout=30), 'revocation left the backend open'
+        await asyncio.wait_for(asyncio.to_thread(exercise), timeout=60)
 
 
 @pytest.mark.asyncio
