@@ -70,6 +70,8 @@ def create_sandbox_service(
 
     if selected_type == "kubernetes":
         implementation = KubernetesSandboxService(config=active_config)
+        if active_config.tenants is not None and active_config.tenants.enforce_ownership:
+            return implementation
         return CompositeSandboxService(
             implementation,
             FastSandboxService(active_config, k8s_client=implementation.k8s_client),

@@ -20,6 +20,10 @@ RESERVED_LABEL_PREFIX = "opensandbox.io/"
 
 SANDBOX_ID_LABEL = "opensandbox.io/id"
 SANDBOX_TENANT_LABEL = "opensandbox.io/tenant"
+# The authenticated subject that owns a resource under [tenants] enforce_ownership.
+# An annotation, not a label: a subject is opaque and need not be label-safe, and
+# authorization compares it exactly.
+SANDBOX_OWNER_SUBJECT_ANNOTATION = "opensandbox.io/owner-subject"
 SANDBOX_EXPIRES_AT_LABEL = "opensandbox.io/expires-at"
 SANDBOX_MANUAL_CLEANUP_LABEL = "opensandbox.io/manual-cleanup"
 SANDBOX_PLATFORM_OS_LABEL = "opensandbox.io/platform-os"
@@ -201,6 +205,7 @@ __all__ = [
     "RESERVED_LABEL_PREFIX",
     "SANDBOX_ID_LABEL",
     "SANDBOX_TENANT_LABEL",
+    "SANDBOX_OWNER_SUBJECT_ANNOTATION",
     "SANDBOX_EXPIRES_AT_LABEL",
     "SANDBOX_MANUAL_CLEANUP_LABEL",
     "SANDBOX_PLATFORM_OS_LABEL",

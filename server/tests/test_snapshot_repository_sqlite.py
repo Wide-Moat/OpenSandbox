@@ -149,3 +149,48 @@ def test_snapshot_repository_factory_closes_and_discards_process_repository(
         assert factory_calls == 2
     finally:
         factory_module.get_snapshot_repository.cache_clear()
+
+
+def test_owner_roundtrip_filter_and_conditional_update(tmp_path):
+    from opensandbox_server.services.snapshot_models import SnapshotRecord, SnapshotState
+    from opensandbox_server.services.snapshot_repository import SnapshotListQuery
+    path = tmp_path / 'owners.db'
+    repo = SQLiteSnapshotRepository(path)
+    for ident, owner in [('a', 'alice'), ('b', 'bob'), ('legacy', None)]:
+        repo.create(SnapshotRecord(id=ident, source_sandbox_id='sandbox', namespace='shared', owner_subject=owner))
+    repo = SQLiteSnapshotRepository(path)
+    record = repo.get('a')
+    assert record is not None
+    assert record.owner_subject == 'alice'
+    record.name = 'updated'
+    repo.update(record)
+    loaded = repo.get('a')
+    assert loaded is not None
+    assert loaded.owner_subject == 'alice'
+    record.status.state = SnapshotState.READY
+    assert repo.update_if_state(record, SnapshotState.CREATING)
+    page = repo.list(SnapshotListQuery(namespace='shared', owner_subject='alice', page_size=1))
+    assert page.total_items == 1
+    assert [r.id for r in page.items] == ['a']
+    loaded = repo.get('legacy')
+    assert loaded is not None
+    assert loaded.owner_subject is None
+
+
+def test_owner_column_migration_preserves_legacy_records(tmp_path):
+    from opensandbox_server.services.snapshot_models import SnapshotRecord
+    path = tmp_path / 'legacy.db'
+    repo = SQLiteSnapshotRepository(path)
+    repo.create(SnapshotRecord(id='legacy', source_sandbox_id='sandbox'))
+    with sqlite3.connect(path) as conn:
+        columns = [row[1] for row in conn.execute('PRAGMA table_info(snapshots)')]
+        if 'owner_subject' in columns:
+            conn.execute('ALTER TABLE snapshots DROP COLUMN owner_subject')
+    migrated = SQLiteSnapshotRepository(path)
+    loaded = migrated.get('legacy')
+    assert loaded is not None
+    assert loaded.owner_subject is None
+    migrated.create(SnapshotRecord(id='new', source_sandbox_id='sandbox', owner_subject='alice'))
+    loaded = SQLiteSnapshotRepository(path).get('new')
+    assert loaded is not None
+    assert loaded.owner_subject == 'alice'

@@ -136,10 +136,12 @@ class K8sDiagnosticsMixin:
                 _get_owned_workload_or_404,
             )
 
+            required_owner = getattr(self, "_required_owner", None)
             _get_owned_workload_or_404(
                 workload_provider,
                 self._resolve_namespace(),
                 sandbox_id,
+                required_subject=required_owner() if required_owner else None,
             )
         label_selector = f"{SANDBOX_ID_LABEL}={sandbox_id}"
         try:
