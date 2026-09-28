@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -23,3 +23,4 @@ class TenantEntry:
     name: str
     namespace: str
     api_keys: Tuple[str, ...] = field(default_factory=tuple)
+    subject: Optional[str] = None

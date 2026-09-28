@@ -34,6 +34,7 @@ class SnapshotListQuery:
     name: str | None = None
     states: list[str] = field(default_factory=list)
     namespace: str | None = None
+    owner_subject: str | None = None
 
 
 @dataclass(slots=True)
