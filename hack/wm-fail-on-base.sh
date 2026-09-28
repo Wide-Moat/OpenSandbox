@@ -513,8 +513,8 @@ copy() { # <path relative to repo root>
 # Go: WM-1 in four packages and the component itself -- which the process-level tests
 # build and start, so on upstream they compile and fail on what the process does -- plus
 # WM-7's stop hook, WM-8's seed through the process and the API's wait, WM-6's flag,
-# WM-9's pause preflight, WM-12 in execd's router, and WM-17 in the task-executor's
-# process shim.
+# WM-9's pause preflight, WM-12 in execd's router, WM-17 in the task-executor's
+# process shim, and WM-20's status write from a stale informer view.
 copy components/egress/pkg/dnsproxy/enforcement_linux_test.go
 copy components/egress/pkg/credentialvault/enforcement_test.go
 copy components/egress/pkg/mitmproxy/regular_mode_test.go
@@ -529,6 +529,10 @@ copy kubernetes/internal/task-executor/runtime/process_test.go
 # WM-9's pause preflight. The test sets the registry through reflection, so on upstream,
 # where the reconciler has no such field, it compiles and fails on what pause does.
 copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
+# WM-20: the expectation's staleness clock, and the stale-cache valve's status write.
+# Both use only upstream symbols, so on upstream they compile and fail on behaviour.
+copy kubernetes/internal/utils/expectations/resource_version_expectation_wm20_test.go
+copy kubernetes/internal/controller/batchsandbox_status_stale_view_test.go
 # Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
