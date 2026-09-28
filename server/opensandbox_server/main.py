@@ -74,6 +74,7 @@ def _build_tenant_provider(config) -> TenantProvider | None:
 
         http_cfg = HTTPTenantProviderConfig(
             endpoint=config.tenants.endpoint,
+            require_subject=config.tenants.enforce_ownership,
             max_stale_seconds=config.tenants.max_stale_seconds,
             timeout_seconds=config.tenants.timeout_seconds,
             auth_header=config.tenants.auth_header,

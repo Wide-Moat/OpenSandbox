@@ -59,9 +59,11 @@ def _get_template_service() -> FastSandboxTemplateService:
     container-sandbox workload provider).
     """
     global _service
+    config = get_config()
+    if config.tenants is not None and config.tenants.enforce_ownership:
+        raise HTTPException(status_code=403, detail="Template administration is unavailable with owner enforcement")
     if _service is not None:
         return _service
-    config = get_config()
     if config.runtime.type == "docker" or config.kubernetes is None:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,

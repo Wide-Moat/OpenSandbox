@@ -20,6 +20,8 @@ using Kubernetes resources for sandbox lifecycle management.
 """
 
 import asyncio
+import base64
+import hashlib
 import logging
 import math
 import time
@@ -51,6 +53,7 @@ from opensandbox_server.config import AppConfig, INGRESS_MODE_GATEWAY, SecureAcc
 from opensandbox_server.services.constants import (
     SANDBOX_ID_LABEL,
     SANDBOX_MANAGED_VOLUMES_LABEL,
+    SANDBOX_OWNER_SUBJECT_ANNOTATION,
     SANDBOX_TENANT_LABEL,
     SandboxErrorCodes,
 )
@@ -86,7 +89,7 @@ from opensandbox_server.services.k8s.workload_access import (
     _delete_workload_or_404,
     _enforce_tenant_ownership,
     _get_owned_workload_or_404,
-    _workload_labels,
+    _visible_to_current_tenant,
 )
 from opensandbox_server.services.sandbox_service import SandboxService
 from opensandbox_server.services.validators import (
@@ -202,7 +205,26 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
     def set_tenant_provider(self, provider: object) -> None:
         self._tenant_provider = provider  # type: ignore[assignment]
 
+    @staticmethod
+    def _owner_label(subject: str) -> str:
+        try:
+            ensure_metadata_labels({"owner": subject})
+            return subject
+        except HTTPException:
+            digest = hashlib.sha256(subject.encode("utf-8")).digest()
+            return "h-" + base64.b32encode(digest).decode("ascii").rstrip("=").lower()
+
+    def _required_owner(self) -> Optional[str]:
+        tenants = self.app_config.tenants
+        if tenants is None or not tenants.enforce_ownership:
+            return None
+        tenant = get_current_tenant()
+        if tenant is None or not isinstance(tenant.subject, str) or not tenant.subject.strip():
+            raise HTTPException(status_code=401, detail="Authenticated subject required")
+        return tenant.subject
+
     def _resolve_namespace(self) -> str:
+        self._required_owner()
         tenant = get_current_tenant()
         return tenant.namespace if tenant else self.namespace
 
@@ -344,6 +366,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         earlier in the same execution flow (e.g. the earlier steps of one
         renew attempt) is memoized so each step pays for the lookup once.
         """
+        self._required_owner()
         tenant = get_current_tenant()
         if tenant:
             return tenant.namespace
@@ -751,6 +774,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         from kubernetes.client import V1PersistentVolumeClaim, V1ObjectMeta
         from kubernetes.client import ApiException
 
+        subject = self._required_owner()
         default_size = self.app_config.storage.volume_default_size
 
         # Multiple Volume entries may legitimately mount the same PVC at
@@ -816,6 +840,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                         },
                     ) from e
                 raise
+            if subject is not None and existing is None and not vol.pvc.create_if_not_exists:
+                raise HTTPException(status_code=404, detail="Volume not found")
             existing_cache[claim_name] = existing
             if existing is not None:
                 self._reject_pvc_owned_by_other_sandbox(existing, claim_name, sandbox_id)
@@ -851,6 +877,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     name=claim_name,
                     namespace=self._resolve_namespace(),
                     labels=pvc_labels or None,
+                    annotations={SANDBOX_OWNER_SUBJECT_ANNOTATION: subject} if subject is not None else None,
                 ),
                 spec={
                     "accessModes": access_modes,
@@ -918,6 +945,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     # Don't add to managed_pvcs — whoever created it owns it.
                     logger.info(f"PVC '{claim_name}' was created concurrently, proceeding")
                 elif e.status == 403:
+                    if subject is not None:
+                        raise HTTPException(status_code=503, detail="Cannot provision an owned volume") from e
                     logger.warning(
                         f"No RBAC permission to create PVC '{claim_name}', skipping. "
                         "The PVC must be pre-created or RBAC must be updated."
@@ -959,6 +988,11 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         are intentionally allowed.
         """
         meta = getattr(pvc, "metadata", None)
+        subject = self._required_owner()
+        if subject is not None:
+            annotations = getattr(meta, "annotations", None) or {}
+            if annotations.get(SANDBOX_OWNER_SUBJECT_ANNOTATION) != subject:
+                raise HTTPException(status_code=404, detail="Volume not found")
         existing_labels = getattr(meta, "labels", None) or {}
         managed_by = existing_labels.get(SANDBOX_MANAGED_VOLUMES_LABEL)
         owner_id = existing_labels.get(SANDBOX_ID_LABEL)
@@ -1037,12 +1071,24 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
 
         Wait for the Pod to be Running and have an IP address before returning.
         """
+        subject = self._required_owner()
+        if subject is not None:
+            if request.template_id:
+                raise HTTPException(status_code=400, detail="templateId is unavailable with owner enforcement")
+            if any(volume.host is not None for volume in request.volumes or []):
+                raise HTTPException(status_code=400, detail="Host-path volumes are not supported with owner enforcement")
+            owner_label = self._owner_label(subject)
+            metadata = dict(request.metadata or {})
+            if "owner" in metadata and metadata["owner"] != owner_label:
+                raise HTTPException(status_code=400, detail="Owner metadata must match authenticated subject")
+            metadata["owner"] = owner_label
+            request = request.model_copy(update={"metadata": metadata})
         pool_ref = (request.extensions or {}).get("poolRef", "").strip()
         has_pool_ref = bool(pool_ref)
         self._ensure_pool_mode_compatible(request, has_pool_ref)
 
         if not has_pool_ref:
-            request = await resolve_sandbox_image_from_request(request)
+            request = await resolve_sandbox_image_from_request(request, required_owner=subject)
             ensure_entrypoint(request.entrypoint or [])
         ensure_metadata_labels(request.metadata)
         ensure_platform_valid(request.platform)
@@ -1087,6 +1133,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 context.labels[SANDBOX_TENANT_LABEL] = tenant.name
             apply_access_renew_extend_seconds_to_mapping(context.annotations, request.extensions)
             apply_extensions_to_mapping(context.annotations, request.extensions)
+            if subject is not None:
+                context.annotations[SANDBOX_OWNER_SUBJECT_ANNOTATION] = subject
 
             ensure_volumes_valid(
                 request.volumes,
@@ -1340,6 +1388,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 self.workload_provider,
                 ns,
                 sandbox_id,
+                required_subject=self._required_owner(),
             )
             return _build_sandbox_from_workload(workload, self.workload_provider)
 
@@ -1354,19 +1403,19 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             namespace=self._resolve_namespace(),
             label_selector=SANDBOX_ID_LABEL,
         )
-        tenant = get_current_tenant()
-        sandboxes = []
-        for workload in workloads:
-            if tenant is not None:
-                owner = _workload_labels(workload).get(SANDBOX_TENANT_LABEL)
-                if owner is not None and owner != tenant.name:
-                    continue
-            sandboxes.append(_build_sandbox_from_workload(workload, self.workload_provider))
-        return sandboxes
+        tenant_subject = self._required_owner()
+        return [
+            _build_sandbox_from_workload(workload, self.workload_provider)
+            for workload in workloads
+            if _visible_to_current_tenant(workload, required_subject=tenant_subject)
+        ]
 
     def list_sandboxes(self, request: ListSandboxesRequest) -> ListSandboxesResponse:
         try:
             return _build_list_sandboxes_response(self.list_sandbox_objects(), request)
+
+        except HTTPException:
+            raise
             
         except Exception as e:
             logger.error(f"Error listing sandboxes: {e}")
@@ -1383,7 +1432,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         if get_current_tenant() is not None:
             # Ownership 404 must not enter the handler below: that path treats
             # 404 as "workload gone" and sweeps still-live managed PVCs.
-            _get_owned_workload_or_404(self.workload_provider, ns, sandbox_id)
+            _get_owned_workload_or_404(
+                self.workload_provider, ns, sandbox_id,
+                required_subject=self._required_owner(),
+            )
         try:
             _delete_workload_or_404(
                 self.workload_provider,
@@ -1421,6 +1473,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         """
         from kubernetes.client import ApiException
 
+        subject = self._required_owner()
         selector = (
             f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server,"
             f"{SANDBOX_ID_LABEL}={sandbox_id}"
@@ -1445,6 +1498,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
 
         for pvc in pvcs:
             metadata = getattr(pvc, "metadata", None)
+            if subject is not None:
+                annotations = getattr(metadata, "annotations", None) or {}
+                if annotations.get(SANDBOX_OWNER_SUBJECT_ANNOTATION) != subject:
+                    continue
             name = getattr(metadata, "name", None) if metadata is not None else None
             if not name:
                 continue
@@ -1471,7 +1528,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         try:
             ns = self._resolve_namespace()
             if get_current_tenant() is not None:
-                _get_owned_workload_or_404(self.workload_provider, ns, sandbox_id)
+                _get_owned_workload_or_404(
+                    self.workload_provider, ns, sandbox_id,
+                    required_subject=self._required_owner(),
+                )
             self.workload_provider.pause_sandbox(sandbox_id, ns)
         except HTTPException:
             raise
@@ -1514,7 +1574,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         try:
             ns = self._resolve_namespace()
             if get_current_tenant() is not None:
-                _get_owned_workload_or_404(self.workload_provider, ns, sandbox_id)
+                _get_owned_workload_or_404(
+                    self.workload_provider, ns, sandbox_id,
+                    required_subject=self._required_owner(),
+                )
             self.workload_provider.resume_sandbox(sandbox_id, ns)
         except HTTPException:
             raise
@@ -1561,7 +1624,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         )
         if not workload:
             return None
-        _enforce_tenant_ownership(workload, sandbox_id)
+        _enforce_tenant_ownership(
+            workload, sandbox_id, required_subject=self._required_owner()
+        )
         if isinstance(workload, dict):
             annotations = workload.get("metadata", {}).get("annotations") or {}
         else:
@@ -1594,6 +1659,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 self.workload_provider,
                 ns,
                 sandbox_id,
+                required_subject=self._required_owner(),
             )
 
             current_expiration = self.workload_provider.get_expiration(workload)
@@ -1632,7 +1698,12 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             self.workload_provider,
             self._resolve_namespace(),
             sandbox_id,
+            required_subject=self._required_owner(),
         )
+
+        subject = self._required_owner()
+        if subject is not None and "owner" in patch and patch["owner"] != self._owner_label(subject):
+            raise HTTPException(status_code=400, detail="Owner metadata is immutable")
 
         if isinstance(workload, dict):
             labels = dict(workload.get("metadata", {}).get("labels") or {})
@@ -1721,7 +1792,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 self.workload_provider,
                 ns,
                 sandbox_id,
+                required_subject=self._required_owner(),
             )
+
 
             if expires is not None:
                 endpoint = self._build_signed_endpoint(sandbox_id, port, expires)

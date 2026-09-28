@@ -31,6 +31,8 @@ DEFAULT_SNAPSHOT_RESTORE_ENTRYPOINT = ["tail", "-f", "/dev/null"]
 
 async def resolve_sandbox_image_from_request(
     request: CreateSandboxRequest,
+    *,
+    required_owner: str | None = None,
 ) -> CreateSandboxRequest:
     """
     Normalize a sandbox create request to an effective image-backed request.
@@ -54,6 +56,17 @@ async def resolve_sandbox_image_from_request(
 
     has_image = request.image is not None and bool(request.image.uri.strip())
     if has_image:
+        # The HTTP route resolves snapshotId before the service runs, and without an
+        # owner, so the service sees an image-backed request. Without this check the
+        # owner test below would never run on that path.
+        resolved_id = (request.snapshot_id or "").strip()
+        if required_owner is not None and resolved_id:
+            record = await run_in_threadpool(get_snapshot_repository().get, resolved_id)
+            if record is None or record.owner_subject != required_owner:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "SNAPSHOT::NOT_FOUND", "message": "Snapshot not found"},
+                )
         return request
 
     snapshot_id = (request.snapshot_id or "").strip()
@@ -68,6 +81,9 @@ async def resolve_sandbox_image_from_request(
                 "message": f"Snapshot {snapshot_id} not found",
             },
         )
+
+    if required_owner is not None and snapshot.owner_subject != required_owner:
+        raise HTTPException(status_code=404, detail={"code": "SNAPSHOT::NOT_FOUND", "message": "Snapshot not found"})
 
     tenant = get_current_tenant()
     if tenant is not None and (snapshot.namespace is None or snapshot.namespace != tenant.namespace):

@@ -54,6 +54,8 @@ def _get_pool_service():
     from opensandbox_server.services.k8s.pool_service import PoolService
 
     config = get_config()
+    if config.tenants is not None and config.tenants.enforce_ownership:
+        raise HTTPException(status_code=403, detail="Shared pool administration is unavailable with owner enforcement")
     if config.runtime.type != "kubernetes":
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
