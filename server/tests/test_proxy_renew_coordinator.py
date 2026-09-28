@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -87,7 +88,7 @@ async def test_proxy_min_interval_skips_second_attempt(monkeypatch):
     work = RenewWorkItem(
         source=RENEW_SOURCE_SERVER_PROXY,
         sandbox_id="sbx-1",
-        observed_at=MagicMock(),
+        observed_at=datetime.now(timezone.utc),
     )
     await consumer._process_work(work)
     await consumer._process_work(work)
@@ -119,7 +120,7 @@ async def test_proxy_second_attempt_after_cooldown_window(monkeypatch):
     work = RenewWorkItem(
         source=RENEW_SOURCE_SERVER_PROXY,
         sandbox_id="sbx-1",
-        observed_at=MagicMock(),
+        observed_at=datetime.now(timezone.utc),
     )
     await consumer._process_work(work)
     await consumer._process_work(work)

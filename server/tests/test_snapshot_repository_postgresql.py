@@ -195,6 +195,7 @@ def test_postgresql_row_timestamps_are_normalized_to_utc() -> None:
             "id": "snap-timezone",
             "source_sandbox_id": "sbx-001",
             "namespace": None,
+            "owner_subject": None,
             "name": None,
             "description": None,
             "restore_config": {"image": None},
