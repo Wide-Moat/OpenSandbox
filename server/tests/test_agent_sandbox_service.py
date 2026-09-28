@@ -106,7 +106,7 @@ class TestAgentSandboxServiceInit:
 
             assert service.namespace == agent_sandbox_runtime_config.namespace
             assert service.execd_image == config.runtime.execd_image
-            mock_k8s_client.assert_called_once_with(agent_sandbox_runtime_config)
+            mock_k8s_client.assert_called_once_with(agent_sandbox_runtime_config, multi_tenant=False)
             mock_provider_factory.assert_called_once()
             call_kwargs = mock_provider_factory.call_args.kwargs
             assert call_kwargs["provider_type"] == "agent-sandbox"

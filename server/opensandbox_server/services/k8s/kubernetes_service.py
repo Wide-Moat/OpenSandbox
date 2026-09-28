@@ -159,7 +159,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         self._cluster_lookup_forbidden_monotonic: Optional[float] = None
 
         try:
-            self.k8s_client = K8sClient(self.app_config.kubernetes)
+            self.k8s_client = K8sClient(
+                self.app_config.kubernetes,
+                multi_tenant=self.app_config.tenants is not None,
+            )
             logger.info("Kubernetes client initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize Kubernetes client: {e}")
