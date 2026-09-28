@@ -529,7 +529,7 @@ copy kubernetes/internal/task-executor/runtime/process_test.go
 # WM-9's pause preflight. The test sets the registry through reflection, so on upstream,
 # where the reconciler has no such field, it compiles and fails on what pause does.
 copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
-# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18.
+# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
 copy server/tests/test_runtime_resolver.py
@@ -544,6 +544,7 @@ copy server/tests/test_proxy_renew_throttle_with_redis.py
 copy server/tests/k8s/test_informer_quiet_fallback.py
 copy server/tests/k8s/test_provider_common.py
 copy server/tests/test_wm18_owner_subject.py
+copy server/tests/test_wm19_proxy_revalidation.py
 
 # Module and package of a Go test file, from the nearest go.mod above it.
 go_package() { # <path> -> "<module dir> <package>"
