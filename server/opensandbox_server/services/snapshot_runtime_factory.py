@@ -164,7 +164,10 @@ def create_snapshot_runtime(
 
         kubernetes_config = getattr(active_config, "kubernetes", None) or KubernetesRuntimeConfig()
         if k8s_client is None:
-            k8s_client = K8sClient(kubernetes_config)
+            k8s_client = K8sClient(
+                kubernetes_config,
+                multi_tenant=getattr(active_config, "tenants", None) is not None,
+            )
 
         namespace = kubernetes_config.namespace or "default"
         kubernetes_runtime: SnapshotRuntime = KubernetesSnapshotRuntime(
