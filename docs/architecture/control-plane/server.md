@@ -65,6 +65,39 @@ The two-replica design avoids leases and leader election by riding on two existi
 
 No exactly-once guarantee is claimed across the database, Kubernetes, and the image registry — the recovery interval shapes peer-takeover latency, not atomicity. Helm wiring of the two-replica topology: [Kubernetes Deployment](/deployment/#use-postgresql-for-server-persistence).
 
+## Resource limit names {#resource-limit-names}
+
+`resourceLimits` and `resourceRequests` are open maps, so any key is accepted by
+request validation. On the Kubernetes runtime the server checks the names before
+building the pod and rejects an unusable one with **HTTP 400**
+(`SANDBOX::INVALID_PARAMETER`), naming every offending key:
+
+```json
+{
+  "code": "SANDBOX::INVALID_PARAMETER",
+  "message": "Kubernetes runtime cannot use resourceLimits ['memoryMB']: ..."
+}
+```
+
+Without this check the name travels into the pod and the **pod** is refused by
+the API server (`must be a standard resource type or fully qualified`) after the
+create request has already returned, so the caller sees
+`KUBERNETES::POD_READY_TIMEOUT` roughly a minute later with the real reason only
+in namespace events.
+
+Accepted names:
+
+| Name | Notes |
+|---|---|
+| `cpu`, `memory`, `ephemeral-storage` | Kubernetes container resources |
+| `hugepages-<size>` | any page size the node advertises, e.g. `hugepages-2Mi`, `hugepages-32Mi` |
+| `vendor.com/name` | fully qualified extended resource, e.g. `nvidia.com/gpu` |
+| `gpu` | portable key, translated to `nvidia.com/gpu` |
+| `disk`, `storage` | Windows profile disk aliases, consumed by the Windows overrides |
+
+Values are Kubernetes quantities: `memory="512Mi"`, `ephemeral-storage="2Gi"`.
+Names such as `memoryMB` or `diskMB` are not resource names and are rejected.
+
 ## Where to go next
 
 - [Kubernetes Controller](/architecture/control-plane/operator) — the operator the server programs on Kubernetes
