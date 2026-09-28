@@ -65,7 +65,7 @@ class TestKubernetesSandboxServiceInit:
             
             assert service.namespace == k8s_app_config.kubernetes.namespace
             assert service.execd_image == k8s_app_config.runtime.execd_image
-            mock_k8s_client.assert_called_once_with(k8s_app_config.kubernetes)
+            mock_k8s_client.assert_called_once_with(k8s_app_config.kubernetes, multi_tenant=False)
             mock_create_provider.assert_called_once()
     
     def test_init_without_kubernetes_config_raises_error(self, app_config_no_k8s):

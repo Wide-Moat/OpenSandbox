@@ -221,6 +221,12 @@ is_guard() {
     # WM-14 throttles only the server's own proxy renews. Ingress throttles its intents
     # before LPUSH, and a popped intent is still renewed every time, as upstream does.
     test_wm14_redis_intents_are_still_renewed_each_time) return 0 ;;
+    # WM-15 quiets only what a tenant deployment refuses on purpose. Without a tenant
+    # provider every refusal is still a WARNING with a traceback, and with one so is a
+    # 403 on a tenant namespace and any other status on the fallback -- as upstream logs
+    # them all.
+    test_wm15_single_tenant_refusals_still_warn_with_a_traceback_each_time) return 0 ;;
+    test_wm15_other_refusals_still_warn_with_a_traceback_each_time) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -518,7 +524,7 @@ copy components/egress/credential_vault_api_wait_test.go
 copy components/egress/cleanup_sleep_test.go
 copy kubernetes/cmd/controller/watch_namespaces_flag_test.go
 copy components/execd/pkg/web/internal_init_test.go
-# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14.
+# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
 copy server/tests/test_runtime_resolver.py
@@ -530,6 +536,7 @@ copy server/tests/k8s/test_sandbox_readiness_probe.py
 copy server/tests/test_proxy_execd_internal.py
 copy server/tests/k8s/test_renew_lookup_unreadable_fallback.py
 copy server/tests/test_proxy_renew_throttle_with_redis.py
+copy server/tests/k8s/test_informer_quiet_fallback.py
 
 # Module and package of a Go test file, from the nearest go.mod above it.
 go_package() { # <path> -> "<module dir> <package>"

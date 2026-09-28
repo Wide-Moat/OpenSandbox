@@ -18,7 +18,7 @@ import logging
 import math
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional
 
 from kubernetes import watch
 from kubernetes.client import ApiException
@@ -43,6 +43,7 @@ class WorkloadInformer:
         enable_watch: bool = True,
         thread_name: str = "workload-informer",
         event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        expected_refusals: Iterable[int] = (),
     ):
         """
         Args:
@@ -59,6 +60,12 @@ class WorkloadInformer:
                      (``ADDED``/``MODIFIED``/``DELETED``) and for every item of
                      an initial/reconciling LIST snapshot (``SYNC``). Handler
                      errors are logged and never kill the watch thread.
+            expected_refusals: HTTP statuses with which the API server is expected
+                     to refuse this LIST/WATCH until the deployment changes (RBAC is
+                     granted, a CRD is installed). The first such refusal is logged
+                     once at INFO, without a traceback, and retries continue on the
+                     usual backoff; the next one after a successful LIST is logged
+                     again. Any other error is logged as before. Empty by default.
         """
         self.list_fn = list_fn
         self.resync_period_seconds = resync_period_seconds
@@ -68,6 +75,10 @@ class WorkloadInformer:
         self._event_handlers: List[Callable[[str, Dict[str, Any]], None]] = (
             [event_handler] if event_handler is not None else []
         )
+
+        self._expected_refusals: FrozenSet[int] = frozenset(expected_refusals)
+        # The expected refusal already reported, until a LIST succeeds again.
+        self._reported_refusal: Optional[int] = None
 
         self._subscribers: Dict[str, List[Callable[[str, Dict[str, Any]], None]]] = {}
 
@@ -212,6 +223,10 @@ class WorkloadInformer:
                     # Resource version too old; force a fresh list on next loop.
                     self._resource_version = None
                     self._has_synced = False
+                elif exc.status in self._expected_refusals:
+                    self._report_expected_refusal(exc)
+                    self._has_synced = False
+                    backoff = self._wait_before_retry(backoff)
                 else:
                     logger.warning(f"Informer watch error: {exc}", exc_info=True)
                     self._has_synced = False
@@ -220,6 +235,18 @@ class WorkloadInformer:
                 logger.warning(f"Unexpected informer error: {exc}", exc_info=True)
                 self._has_synced = False
                 backoff = self._wait_before_retry(backoff)
+
+    def _report_expected_refusal(self, exc: ApiException) -> None:
+        """Log an expected refusal once, not a traceback per retry."""
+        if self._reported_refusal == exc.status:
+            logger.debug(f"Informer {self._thread_name}: still refused ({exc.status})")
+            return
+        self._reported_refusal = exc.status
+        logger.info(
+            f"Informer {self._thread_name}: the API server refuses this list "
+            f"({exc.status} {exc.reason}); retrying quietly, reads go to the API "
+            "directly until it succeeds"
+        )
 
     def _wait_before_retry(self, backoff: float) -> float:
         """Wait interruptibly and return the next bounded retry delay."""
@@ -253,6 +280,7 @@ class WorkloadInformer:
             self._resource_version = resource_version
             self._has_synced = True
             self._last_contact_at = time.monotonic()
+            self._reported_refusal = None
 
         # React to the snapshot outside the lock: a LIST reconciles objects
         # that changed while no watch was connected (startup, reconnect).

@@ -49,8 +49,19 @@ class K8sClient:
     RuntimeClass). Callers never hold raw API handles directly.
     """
 
-    def __init__(self, k8s_config: KubernetesRuntimeConfig):
+    def __init__(self, k8s_config: KubernetesRuntimeConfig, *, multi_tenant: bool = False):
+        """
+        Args:
+            k8s_config: The ``[kubernetes]`` section.
+            multi_tenant: True when ``[tenants]`` is configured. The configured
+                namespace is then only a fallback, and a deployment may grant the
+                server nothing there -- RBAC scoped to the tenant namespaces, or a
+                fallback that deliberately does not exist -- so an informer on it
+                can be refused for as long as the server runs. See
+                ``_expected_informer_refusals``.
+        """
         self.config = k8s_config
+        self._multi_tenant = multi_tenant
         self._load_config()
         self._core_v1_api: Optional[CoreV1Api] = None
         self._custom_objects_api: Optional[CustomObjectsApi] = None
@@ -110,6 +121,23 @@ class K8sClient:
         with self._informers_lock:
             return self._informers.get(key)
 
+    def _expected_informer_refusals(self, namespace: str) -> frozenset:
+        """Statuses an informer on ``namespace`` reports once instead of per retry.
+
+        Only with a tenant provider. There the configured namespace is a fallback
+        nothing is required to grant (403, or 404 where it does not exist), and a
+        404 on a tenant namespace means the resource is not served at all -- a
+        CRD that is not installed, which the read paths already treat as empty.
+        A 403 on a tenant namespace stays loud: that is the namespace the server
+        exists to serve. Without a tenant provider nothing is expected: the
+        configured namespace is the only one the server owns.
+        """
+        if not self._multi_tenant:
+            return frozenset()
+        if namespace == (self.config.namespace or "default"):
+            return frozenset({403, 404})
+        return frozenset({404})
+
     def _get_informer(
         self,
         group: str,
@@ -134,8 +162,11 @@ class K8sClient:
                     list_fn=list_fn,
                     resync_period_seconds=self.config.informer_resync_seconds,
                     watch_timeout_seconds=self.config.informer_watch_timeout_seconds,
-                    thread_name=f"workload-informer-{plural}-{namespace}",
+                    # The group too: sandboxsnapshots exists in two API groups,
+                    # and the name is what the informer's own log lines carry.
+                    thread_name=f"workload-informer-{plural}.{group}-{namespace}",
                     event_handler=event_handler,
+                    expected_refusals=self._expected_informer_refusals(namespace),
                 )
                 self._informers[key] = informer
                 try:

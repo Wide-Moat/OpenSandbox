@@ -173,7 +173,10 @@ class FastSandboxTemplateService:
 
     def _kubernetes(self) -> K8sClient:
         if self._k8s_client is None:
-            self._k8s_client = K8sClient(self._k8s_config)
+            self._k8s_client = K8sClient(
+                self._k8s_config,
+                multi_tenant=getattr(self._config, "tenants", None) is not None,
+            )
         return self._k8s_client
 
     def _resolve_namespace(self) -> str:
