@@ -52,8 +52,13 @@ func (r *realResourceVersionExpectation) Expect(obj metav1.Object) {
 	if expectations == nil {
 		r.objectVersions[obj.GetUID()] = &objectCacheVersions{}
 	}
-	if isResourceVersionNewer(r.objectVersions[obj.GetUID()].version, obj.GetResourceVersion()) {
-		r.objectVersions[obj.GetUID()].version = obj.GetResourceVersion()
+	current := r.objectVersions[obj.GetUID()]
+	if current.version != obj.GetResourceVersion() && isResourceVersionNewer(current.version, obj.GetResourceVersion()) {
+		current.version = obj.GetResourceVersion()
+		// The staleness clock belongs to the expectation it measures. Kept across a
+		// newer write, it made a write just made read as long overdue, and callers that
+		// act on a long-unmet expectation acted on a cache one update behind.
+		current.firstUnsatisfiedTimestamp = time.Time{}
 	}
 }
 
