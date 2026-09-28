@@ -60,6 +60,39 @@ One `SandboxService` interface, three implementations:
 
 Backend-specific behavior stays behind the service boundary: the API, response models, and SDKs are identical across all three.
 
+## Resource limit names {#resource-limit-names}
+
+`resourceLimits` and `resourceRequests` are open maps, so any key is accepted by
+request validation. On the Kubernetes runtime the server checks the names before
+building the pod and rejects an unusable one with **HTTP 400**
+(`SANDBOX::INVALID_PARAMETER`), naming every offending key:
+
+```json
+{
+  "code": "SANDBOX::INVALID_PARAMETER",
+  "message": "Kubernetes runtime cannot use resourceLimits ['memoryMB']: ..."
+}
+```
+
+Without this check the name travels into the pod and the **pod** is refused by
+the API server (`must be a standard resource type or fully qualified`) after the
+create request has already returned, so the caller sees
+`KUBERNETES::POD_READY_TIMEOUT` roughly a minute later with the real reason only
+in namespace events.
+
+Accepted names:
+
+| Name | Notes |
+|---|---|
+| `cpu`, `memory`, `ephemeral-storage` | Kubernetes container resources |
+| `hugepages-<size>` | any page size the node advertises, e.g. `hugepages-2Mi`, `hugepages-32Mi` |
+| `vendor.com/name` | fully qualified extended resource, e.g. `nvidia.com/gpu` |
+| `gpu` | portable key, translated to `nvidia.com/gpu` |
+| `disk`, `storage` | Windows profile disk aliases, consumed by the Windows overrides |
+
+Values are Kubernetes quantities: `memory="512Mi"`, `ephemeral-storage="2Gi"`.
+Names such as `memoryMB` or `diskMB` are not resource names and are rejected.
+
 ## Docker deletion {#docker-deletion}
 
 Deletion synchronously removes the application, stops and removes its egress sidecar, then cleans up volumes. Docker allows 9 seconds for [egress shutdown](/architecture/network/egress#shutdown) before forced termination; the full request can take longer. If application removal fails, dependent resources and metadata are kept for retry — TTL cleanup retries after 30 seconds without changing the expiration. Sidecar cleanup is best effort, so a `404` does not guarantee that every resource is gone.
