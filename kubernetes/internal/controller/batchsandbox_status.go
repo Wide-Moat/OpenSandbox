@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -425,20 +426,25 @@ func (r *BatchSandboxReconciler) persistRuntimeView(
 		// Skip redundant status writes caused by informer cache lag: if we recently
 		// patched status but the informer hasn't seen the new RV yet, the diff is a
 		// false positive. Allow a 10s safety valve in case the cache never catches up.
+		requireVersion := false
 		if satisfied, dur := r.StatusRVExpectation.IsSatisfied(batchSbx); !satisfied {
 			if dur < 10*time.Second {
 				log.Info("Skipping status update: informer cache is stale", "unsatisfiedDuration", dur.String())
 				return time.Second, aggErrors
 			}
 			log.Info("Proceeding with status update despite stale cache (timeout exceeded)", "unsatisfiedDuration", dur.String())
-			// Fetch the latest object so lifecycle conditions (PauseFailed/ResumeFailed)
-			// written by pause/resume handlers are not overwritten by the stale cache.
-			latest := &sandboxv1alpha1.BatchSandbox{}
-			if err := r.Get(ctx, types.NamespacedName{Namespace: batchSbx.Namespace, Name: batchSbx.Name}, latest); err == nil {
-				batchSbx = latest
-			}
+			// Re-reading here would read the same informer cache, so the view may still
+			// lack lifecycle conditions (PauseFailed/ResumeFailed) the pause/resume
+			// handlers have written since. The write is made conditional on the
+			// resourceVersion instead: a view older than the server is refused with a
+			// conflict, and the next reconcile works from a newer one.
+			requireVersion = true
 		}
-		if err := r.updateStatus(ctx, batchSbx, view.status); err != nil {
+		if err := r.updateStatus(ctx, batchSbx, view.status, requireVersion); err != nil {
+			if errors.IsConflict(err) {
+				log.Info("Status update refused: the object changed since this view; requeueing", "resourceVersion", batchSbx.ResourceVersion)
+				return time.Second, aggErrors
+			}
 			aggErrors = append(aggErrors, err)
 			return 0, aggErrors
 		}
@@ -477,11 +483,20 @@ func (r *BatchSandboxReconciler) patchBatchSandboxEndpoints(ctx context.Context,
 	return r.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData))
 }
 
-func (r *BatchSandboxReconciler) updateStatus(ctx context.Context, batchSandbox *sandboxv1alpha1.BatchSandbox, newStatus *sandboxv1alpha1.BatchSandboxStatus) error {
+func (r *BatchSandboxReconciler) updateStatus(ctx context.Context, batchSandbox *sandboxv1alpha1.BatchSandbox, newStatus *sandboxv1alpha1.BatchSandboxStatus, requireVersion bool) error {
 	log := logf.FromContext(ctx)
 	mergedStatus := newStatus.DeepCopy()
 	mergedStatus.Conditions = mergeLifecycleConditions(mergedStatus.Conditions, batchSandbox.Status.Conditions)
-	patchData, err := json.Marshal(map[string]any{"status": mergedStatus})
+	// A merge patch replaces `conditions` as a whole, and the lifecycle conditions kept
+	// above are only those this object carries. Written from an informer copy older than
+	// the server, the patch would drop a PauseFailed/ResumeFailed written after that copy
+	// was taken -- and nothing writes it again. With requireVersion the write succeeds
+	// only while the server is still at the version the status was computed from.
+	body := map[string]any{"status": mergedStatus}
+	if requireVersion && batchSandbox.ResourceVersion != "" {
+		body["metadata"] = map[string]any{"resourceVersion": batchSandbox.ResourceVersion}
+	}
+	patchData, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("failed to marshal status patch: %w", err)
 	}
