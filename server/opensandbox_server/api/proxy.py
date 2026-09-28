@@ -24,6 +24,7 @@ from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 import anyio
+from anyio.to_thread import run_sync
 import httpx
 import websockets
 from fastapi import APIRouter, Request, WebSocket, status
@@ -45,7 +46,8 @@ from opensandbox_server.services.constants import (
     OPEN_SANDBOX_INGRESS_HEADER,
     OPEN_SANDBOX_SECURE_ACCESS_HEADER,
 )
-from opensandbox_server.tenants.context import set_current_tenant
+from opensandbox_server.tenants.context import get_current_tenant, set_current_tenant
+from opensandbox_server.tenants.models import TenantEntry
 from opensandbox_server.tenants.provider import TenantProviderUnavailable
 
 logger = logging.getLogger(__name__)
@@ -435,7 +437,9 @@ class _ProxyStreamingResponse(StreamingResponse):
         *,
         status_code: int,
         raw_headers: list[tuple[bytes, bytes]],
+        authorization: Optional["_ProxyAuthorization"] = None,
     ) -> None:
+        self._authorization = authorization
         self._backend_response = resp
         super().__init__(
             content=_stream_backend_response(resp),
@@ -446,7 +450,15 @@ class _ProxyStreamingResponse(StreamingResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            await super().__call__(scope, receive, send)
+            if self._authorization is None:
+                await super().__call__(scope, receive, send)
+            else:
+                async with anyio.create_task_group() as group:
+                    group.start_soon(self._authorization.watch, group.cancel_scope)
+                    try:
+                        await super().__call__(scope, receive, send)
+                    finally:
+                        group.cancel_scope.cancel()
         finally:
             # The body iterator may never start if the downstream disconnects
             # while Starlette sends response headers. Keep ownership here so
@@ -512,6 +524,7 @@ async def _proxy_http_request(
                 "message": _EXECD_INTERNAL_REFUSAL,
             },
         )
+    authorization = await _strict_proxy_authorization(request)
     resolve_internal = get_config().proxy.resolve_internal
     endpoint = lifecycle.sandbox_service.get_endpoint(
         sandbox_id,
@@ -580,6 +593,7 @@ async def _proxy_http_request(
                 resp,
                 status_code=resp.status_code,
                 raw_headers=response_headers,
+                authorization=authorization,
             )
         except BaseException:
             # Until ownership passes to _ProxyStreamingResponse, any failure
@@ -698,6 +712,54 @@ async def _relay_backend_messages(
         cancel_scope.cancel()
 
 
+# Strict streams refresh against the identity endpoint, not its TTL cache.
+_PROXY_RECHECK_SECONDS = 30.0
+_PROXY_AUTH_TIMEOUT_SECONDS = 10.0
+
+
+class _ProxyAuthorization:
+    def __init__(self, connection: Request | WebSocket) -> None:
+        self.provider = getattr(connection.app.state, "tenant_provider", None)
+        self.key = connection.headers.get(SANDBOX_API_KEY_HEADER)
+        tenant = get_current_tenant()
+        self.identity = (tenant.subject, tenant.namespace) if tenant else None
+
+    async def valid(self) -> bool:
+        refresh = getattr(self.provider, "lookup_fresh", None)
+        if not callable(refresh) or not self.key or not self.identity or not self.identity[0]:
+            return False
+        try:
+            with anyio.fail_after(_PROXY_AUTH_TIMEOUT_SECONDS):
+                tenant = await run_sync(refresh, self.key, abandon_on_cancel=True)
+            return isinstance(tenant, TenantEntry) and (tenant.subject, tenant.namespace) == self.identity
+        except Exception:
+            # No identity, key, provider response or upstream error enters logs.
+            return False
+
+    async def watch(self, cancel_scope: anyio.CancelScope, websocket: Optional[WebSocket] = None) -> None:
+        while True:
+            await anyio.sleep(_PROXY_RECHECK_SECONDS)
+            if not await self.valid():
+                if websocket is not None:
+                    with anyio.move_on_after(5, shield=True):
+                        try:
+                            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                        except Exception:
+                            pass
+                cancel_scope.cancel()
+                return
+
+
+async def _strict_proxy_authorization(connection: Request | WebSocket) -> Optional[_ProxyAuthorization]:
+    tenants = getattr(get_config(), "tenants", None)
+    if tenants is None or not tenants.enforce_ownership:
+        return None
+    authorization = _ProxyAuthorization(connection)
+    if not await authorization.valid():
+        raise HTTPException(status_code=401, detail="Proxy authorization unavailable")
+    return authorization
+
+
 async def _proxy_websocket_request(
     websocket: WebSocket,
     sandbox_id: str,
@@ -705,6 +767,11 @@ async def _proxy_websocket_request(
     full_path: str,
 ) -> None:
     if not await _authenticate_websocket_tenant(websocket):
+        return
+    try:
+        authorization = await _strict_proxy_authorization(websocket)
+    except HTTPException:
+        await _fail_client_websocket(websocket, status.WS_1008_POLICY_VIOLATION)
         return
 
     if _leaves_the_proxied_port(full_path):
@@ -778,6 +845,8 @@ async def _proxy_websocket_request(
         ) as backend:
             await websocket.accept(subprotocol=backend.subprotocol)
             async with anyio.create_task_group() as task_group:
+                if authorization is not None:
+                    task_group.start_soon(authorization.watch, task_group.cancel_scope, websocket)
                 task_group.start_soon(
                     _relay_client_messages,
                     websocket,
