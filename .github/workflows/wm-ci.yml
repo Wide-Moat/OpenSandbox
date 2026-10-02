@@ -238,3 +238,110 @@ jobs:
         run: |
           echo "ghcr.io/wide-moat/opensandbox-${{ matrix.name }}@${{ steps.build.outputs.digest }}" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # The CRDs as a Helm chart, oci://ghcr.io/wide-moat/charts/opensandbox-crds, at
+  # <controller chart version>-g<sha7>. An installation of the Wide Moat platform used to
+  # apply kubernetes/config/crd/bases straight from this repository at the branch `wm` -- a
+  # source that moves, and one a buyer installing from a release would have to reach GitHub
+  # to read. The platform's release now pins this chart instead. hack/wm-crds-chart.sh says
+  # what is packaged and why nothing of the chart is committed.
+  #
+  # Gated on the same jobs as the images, so a chart exists for exactly the commits whose
+  # images exist. A pull request packages, compares with the source and asks the registry
+  # whether the version exists (--probe) -- the lookup a push depends on, exercised before
+  # wm needs it. Only wm pushes, and never over a version that is already there.
+  #
+  # PUBLIC, like every image this repository publishes and like the upstream chart the
+  # platform already consumes (computer-use-server): it is the content of a public
+  # Apache-2.0 repository, so private would hide nothing -- and would cost a per-package
+  # "Manage Actions access" grant for every repository that reads it with its own token.
+  # Asserted after every push, because anyone with admin on the package can change it.
+  crds-chart:
+    needs:
+      - changes-are-accounted-for
+      - egress-tests
+      - execd-tests
+      - kubernetes-tests
+      - server-tests
+      - chart-docs
+      - controller-chart
+      - tests-fail-without-the-changes
+    runs-on: ubuntu-latest
+    # Seconds of work. Anything near this is a stalled registry holding a runner.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      REPOSITORY: oci://ghcr.io/wide-moat/charts
+      PUBLISH: ${{ github.ref == 'refs/heads/wm' && github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The helm the Wide Moat platform packages its own charts with.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.3
+
+      # Checked against the release's own checksums.txt before it is unpacked: this binary is
+      # handed the registry credential.
+      - name: install crane
+        run: |
+          set -euo pipefail
+          # Sums from go-containerregistry v0.20.2 checksums.txt.
+          case "$(uname -m)" in
+            x86_64)        arch=x86_64; sum=c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b ;;
+            aarch64|arm64) arch=arm64;  sum=aff0db48825124c9331ea310057214bd4e92c01aa2e414d539e9659841d9422a ;;
+            *) echo "::error::no crane checksum for architecture $(uname -m)"; exit 1 ;;
+          esac
+          curl -sSL --fail --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 -o "$RUNNER_TEMP/crane.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_${arch}.tar.gz"
+          echo "$sum  $RUNNER_TEMP/crane.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/bin" crane
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: the publisher can still refuse
+        run: hack/wm-crds-chart-selftest.sh
+
+      # crane on every event: the pull request's --probe reads the registry too. helm only where
+      # it pushes and pulls. --password-stdin: argv is visible through ps.
+      - name: log in to GHCR
+        env:
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_PASSWORD" | crane auth login ghcr.io -u "$ACTOR" --password-stdin
+          if [ "$PUBLISH" = true ]; then
+            printf '%s' "$REGISTRY_PASSWORD" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
+          fi
+
+      - name: package, compare with the source, and on wm publish and read back
+        run: |
+          set -euo pipefail
+          mode=--probe; [ "$PUBLISH" = true ] && mode=--push
+          # GITHUB_SHA cut to seven rather than `git rev-parse --short`, which grows when seven
+          # characters are ambiguous. On a pull request it is the merge commit: nothing is pushed.
+          hack/wm-crds-chart.sh "${GITHUB_SHA:0:7}" "$REPOSITORY" "$RUNNER_TEMP/published.txt" "$mode"
+          {
+            echo "### opensandbox-crds ($mode)"
+            echo
+            echo "\`$REPOSITORY\` -- name, version, digest (\`-\` where nothing was published)"
+            echo
+            sed 's/^/    /' "$RUNNER_TEMP/published.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Read from the API rather than assumed. On a pull request nothing was pushed, so a package
+      # that does not exist yet is allowed -- only when the registry agrees it is absent.
+      - name: the package is public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          allow=--allow-absent; [ "$PUBLISH" = true ] && allow=""
+          hack/wm-package-visibility.sh "$OWNER" "$REPOSITORY/opensandbox-crds" public $allow
