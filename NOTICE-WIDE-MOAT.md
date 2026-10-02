@@ -119,6 +119,26 @@ upstream's `Release` workflow ran on the first push, cut a release, and **moved 
 tag onto a fork commit** — after which every gate comparing against that tag was
 comparing against the wrong tree and reporting success.
 
+## What this fork publishes
+
+`wm-ci` publishes, from `wm` only and after every gate above has passed, the images
+`ghcr.io/wide-moat/opensandbox-*` and one Helm chart,
+`oci://ghcr.io/wide-moat/charts/opensandbox-crds`. The chart is the CRDs in
+`kubernetes/config/crd/bases`, copied into the chart's `crds/` when it is built, at version
+`<manifests/charts/controller version>-g<sha7>`. Nothing of the chart is committed, so it
+cannot drift from that directory -- whether the directory itself is current with
+controller-gen is not something this job checks. A version is never pushed over:
+`hack/wm-crds-chart.sh` pushes only what the registry says is absent, and compares what it
+reads back with the tree. It exists so that the Wide Moat platform's release can pin these
+definitions instead of applying the directory from this branch, which moves.
+
+The chart package is meant to be public, like the images (measured 2026-10-02: all six
+`opensandbox-*` image packages public, each created by this workflow's token). The job reads
+the visibility back after every push and fails if it is anything else. If the first push
+ever creates it private, the job fails on that push, and making it public is a one-time
+step in the package's settings on GitHub; the REST API cannot change a package's
+visibility.
+
 ## Keeping the set honest
 
 `hack/wm-check.sh` requires three independently derived sets to agree: the ids in the
