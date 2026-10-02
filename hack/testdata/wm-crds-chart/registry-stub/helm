@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# A registry that can misbehave on purpose, in front of the real helm ($STUB_REAL_HELM). Packages
+# live in $STUB_REGISTRY as <name>-<version>.tgz; every push is logged to $STUB_REGISTRY/push.log.
+#   STUB_PUSH_FAILS=1      `helm push` fails as an upload would.
+#   STUB_TEMPLATE_FAILS=1  `helm template` prints the real render and then exits 1.
+set -uo pipefail
+case "${1:-}" in
+  push)
+    [ "${STUB_PUSH_FAILS:-}" = 1 ] && { echo "Error: unexpected status from POST request: 500 Internal Server Error" >&2; exit 1; }
+    echo "push $(basename "$2")" >> "$STUB_REGISTRY/push.log"
+    cp "$2" "$STUB_REGISTRY/"
+    ;;
+  pull)
+    # helm pull oci://<repo>/<name> --version <v> -d <dir>
+    name=${2##*/}; version=$4; dir=$6
+    [ -f "$STUB_REGISTRY/$name-$version.tgz" ] || { echo "Error: $2:$version: not found" >&2; exit 1; }
+    cp "$STUB_REGISTRY/$name-$version.tgz" "$dir/"
+    ;;
+  template)
+    "$STUB_REAL_HELM" "$@" || exit
+    [ "${STUB_TEMPLATE_FAILS:-}" = 1 ] && { echo "Error: stub: the render failed after printing it" >&2; exit 1; }
+    exit 0
+    ;;
+  *) exec "$STUB_REAL_HELM" "$@" ;;
+esac

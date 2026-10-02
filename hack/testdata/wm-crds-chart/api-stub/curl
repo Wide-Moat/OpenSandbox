@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Stand-in for the GitHub packages API. Answers `curl ... -o <body> -w '%{http_code}' <url>` from
+# $STUB_API/package.{json,status}; with no .status file it answers 404, as the API answers a package
+# that does not exist -- or one this token may not see.
+set -uo pipefail
+body=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) body=$2; shift 2 ;;
+    -H|-w|--max-time|--connect-timeout) shift 2 ;;
+    *) shift ;;
+  esac
+done
+status=404; [ -f "$STUB_API/package.status" ] && status=$(cat "$STUB_API/package.status")
+if [ -f "$STUB_API/package.json" ]; then cp "$STUB_API/package.json" "$body"; else echo '{"message":"Package not found."}' > "$body"; fi
+printf '%s' "$status"

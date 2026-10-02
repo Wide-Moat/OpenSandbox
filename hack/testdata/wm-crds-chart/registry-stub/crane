@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Stand-in for `crane digest` and `crane ls` against $STUB_REGISTRY, a directory holding packages as
+# <name>-<version>.tgz, answering in the words ghcr.io uses (measured with crane on 2026-10-02):
+#   absent tag or package, authenticated:  "MANIFEST_UNKNOWN: manifest unknown", exit 1
+#   a package with no tags at all, `ls`:   "NAME_UNKNOWN: repository name not known to registry", exit 1
+#   STUB_CRANE=denied  every call is refused, as a registry refuses a bad credential.
+set -uo pipefail
+case "${1:-}" in digest|ls) ;; *) echo "stub crane: only 'digest' and 'ls' are implemented, got '$*'" >&2; exit 2 ;; esac
+if [ "${STUB_CRANE:-}" = denied ]; then
+  echo "Error: GET https://registry.example.invalid/token?scope=repository: DENIED: requested access to the resource is denied" >&2; exit 1
+fi
+if [ "$1" = ls ]; then
+  name=${2##*/}; found=0
+  for f in "$STUB_REGISTRY/$name"-*.tgz; do [ -f "$f" ] || continue; found=1; f=${f##*/}; f=${f%.tgz}; echo "${f#"$name"-}"; done
+  [ "$found" = 1 ] || { echo "Error: reading tags for $2: NAME_UNKNOWN: repository name not known to registry" >&2; exit 1; }
+  exit 0
+fi
+ref=$2; tag=${ref##*:}; name=${ref%:*}; name=${name##*/}
+f="$STUB_REGISTRY/$name-$tag.tgz"
+[ -f "$f" ] || { echo "Error: GET https://registry.example.invalid/v2/charts/$name/manifests/$tag: MANIFEST_UNKNOWN: manifest unknown" >&2; exit 1; }
+echo "sha256:$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f"; } | awk '{ print $1 }')"
