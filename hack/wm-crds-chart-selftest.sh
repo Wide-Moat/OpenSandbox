@@ -52,8 +52,12 @@ cp "$root"/kubernetes/config/crd/bases/*.yaml "$linked/"
 ln -s "$fx/stray/widgets.example.invalid.yaml" "$linked/widgets.example.invalid.yaml"
 expect "a symlinked manifest beside the CRDs is refused, not silently left out" 1 "widgets.example.invalid.yaml is not a regular file" \
   env CRD_DIR="$linked" bash "$sut" abc1234 "$repo" "$out"
-expect "a base version that is not major.minor.patch is refused" 1 "is not <major.minor.patch>-g<sha7>" \
+expect "a base version that is not major.minor.patch is refused" 1 "is not <major.minor.patch[-pre-release]>-g<sha7>" \
   env BASE_CHART="$fx/bad-version/Chart.yaml" bash "$sut" abc1234 "$repo" "$out"
+# Upstream cuts release candidates; a pre-release base must still package, as one semver
+# pre-release. Pinned here so it stays covered whatever the real chart's version is today.
+expect "a pre-release base version is packaged at <base>-g<sha7>" 0 "opensandbox-crds 1.2.3-rc.1-gabc1234: $n_crds CRDs, packaged" \
+  env BASE_CHART="$fx/rc-version/Chart.yaml" bash "$sut" abc1234 "$repo" "$out"
 expect "a sha that is not seven hex characters is refused" 2 "is not seven hex characters" \
   bash "$sut" ABC "$repo" "$out"
 expect "a repository without oci:// is refused" 2 "repository must be oci://" \
