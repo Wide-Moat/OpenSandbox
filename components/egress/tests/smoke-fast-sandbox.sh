@@ -498,6 +498,14 @@ else
   [ "${code}" = "404" ] || fail "active API: unknown IP must 404, got ${code}"
   pass "active API dispatch (unknown IP 404, no-vault 404)"
 
+  # The sandbox reaches 10.99.0.2 by address and names the host in Host/SNI. The
+  # credential proxy injects a binding's credential only for an address the bound
+  # name resolves to (transparent mode, WM-21), and mitmdump resolves through this
+  # machine's /etc/hosts; Test 13 reuses the same backup and restore.
+  HOSTS_BACKUP="$(mktemp /tmp/fast-sandbox-hosts.XXXXXX)"
+  cp /etc/hosts "${HOSTS_BACKUP}"
+  echo "10.99.0.2 ext.test alt.test" >> /etc/hosts
+
   # Deny-first: 80/443 is DNATed to the shared mitm and delivered locally,
   # so the Pod-netns INPUT enforcement chain (ct-original policy) is the
   # authoritative layer even before any policy is applied.
@@ -562,10 +570,10 @@ else
   # check (the CA delivery into sandboxes is fast-sandbox issue #19); the
   # mitm's own upstream validation is disabled via ssl_insecure (self-signed
   # ext cert). The client=10.99.0.1 oracle still proves the mitm proxied it.
-  out="$(ip netns exec osb-sandbox-a curl -sk -m 5 -H 'Host: ext.test' https://10.99.0.2/)"
+  out="$(ip netns exec osb-sandbox-a curl -sk -m 5 --resolve ext.test:443:10.99.0.2 https://ext.test/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "https request did not traverse the shared mitm; got: ${out}"
   echo "${out}" | grep -qi "x-api-key: secret-v1" || fail "mitm must inject subject a's credential over TLS; got: ${out}"
-  out="$(ip netns exec osb-sandbox-b curl -sk -m 5 -H 'Host: alt.test' https://10.99.0.2/)"
+  out="$(ip netns exec osb-sandbox-b curl -sk -m 5 --resolve alt.test:443:10.99.0.2 https://alt.test/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "subject b https request did not traverse the shared mitm; got: ${out}"
   echo "${out}" | grep -qi "x-api-key: secret-v2" || fail "mitm must inject subject b's credential over TLS; got: ${out}"
   pass "HTTPS data plane (TLS interception + per-subject injection)"
@@ -679,10 +687,8 @@ else
   wait_for 5 "connect relay up" bash -c "ip netns exec osb-ext curl -s -m 2 http://127.0.0.1:3128/_count | grep -q 'relayed='"
   relay_count() { ip netns exec osb-ext curl -s -m 2 http://127.0.0.1:3128/_count | sed -n 's/^relayed=//p'; }
 
-  HOSTS_BACKUP="$(mktemp /tmp/fast-sandbox-hosts.XXXXXX)"
-  cp /etc/hosts "${HOSTS_BACKUP}"
   # osb-ext shares this hosts file: the relay must resolve absolute-URI hosts.
-  echo "10.99.0.2 proxy.test ext.test" >> /etc/hosts
+  echo "10.99.0.2 proxy.test" >> /etc/hosts
 
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
@@ -712,7 +718,7 @@ else
   echo "${out}" | grep -qi "x-api-key: chain-v1" || fail "chained http lost mitm credential injection; got: ${out}"
   after="$(relay_count)"
   [ "${after}" -gt "${before}" ] || fail "chained http must traverse the forward relay (count ${before} -> ${after})"
-  out="$(ip netns exec osb-sandbox-a curl -sk -m 8 -H 'Host: ext.test' https://10.99.0.2/)"
+  out="$(ip netns exec osb-sandbox-a curl -sk -m 8 --resolve ext.test:443:10.99.0.2 https://ext.test/)"
   echo "${out}" | grep -qi "x-api-key: chain-v1" || fail "chained https lost mitm credential injection; got: ${out}"
   [ "$(relay_count)" -gt "${after}" ] || fail "chained https must traverse the CONNECT tunnel"
   pass "chained data plane (sandbox -> mitm -> CONNECT relay -> ext, http + https)"

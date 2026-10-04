@@ -249,7 +249,7 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
             "\n"
             "\n"
             "def requestheaders(flow) -> None:\n"
-            "    if flow.request.host == 'code.example.com':\n"
+            "    if flow.request.host in ('code.example.com', '203.0.113.9'):\n"
             "        flow.request.host = '127.0.0.1'\n"
             "        flow.request.port = int(os.environ['OPENSANDBOX_TEST_UPSTREAM_PORT'])\n"
         )
@@ -476,6 +476,34 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
         merged = "\n".join(self._log)
         self.assertIn("headers=Authorization", merged)
         self.assertNotIn("synthetic-token", merged)
+        self._assert_no_crash()
+
+    def test_spoofed_host_header_reaches_no_upstream_with_a_credential(self) -> None:
+        """The reviewer's reproduction: the proxy connects to the host in the
+        absolute URI, so a ``Host`` naming a bound host must neither get the
+        credential nor reach the destination. 203.0.113.9 is rerouted to the
+        local upstream by the shim AFTER the addon has decided, so a leak would
+        show as a hit carrying the Authorization header."""
+        self._upstream_hit.clear()
+        hits_before = self._upstream_hit_count()
+        with self._upstream_lock:
+            type(self)._upstream_authorization = None
+        conn = self._conn()
+        try:
+            conn.putrequest("POST", "http://203.0.113.9/v1/chat/completions", skip_host=True)
+            conn.putheader("Host", "code.example.com")
+            conn.putheader("Content-Length", str(len(SMALL_BODY)))
+            conn.endheaders(SMALL_BODY)
+            response = conn.getresponse()
+            status = response.status
+            response.read()
+        finally:
+            conn.close()
+        self.assertEqual(403, status)
+        self.assertFalse(self._upstream_hit.wait(0.5))
+        self.assertEqual(hits_before, self._upstream_hit_count())
+        self.assertIsNone(self._upstream_last_authorization())
+        self.assertNotIn("synthetic-token", "\n".join(self._log))
         self._assert_no_crash()
 
     def test_lookup_failures_deny_buffered_and_streamed_requests(self) -> None:
