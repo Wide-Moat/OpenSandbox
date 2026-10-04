@@ -188,6 +188,20 @@ is_guard() {
     test_wm2_still_warns_gvisor_with_sidecar_enforcement) return 0 ;;
     test_wm2_docker_still_warns_gvisor_under_external_enforcement) return 0 ;;
     test_wm4_load_config_without_env_uses_toml_tenants_auth_token) return 0 ;;
+    # WM-21: what must NOT change. A request whose Host agrees with its destination is
+    # injected as before, case and a trailing dot are not a disagreement, and traffic no
+    # binding covers (or with no vault at all) passes untouched -- all true on upstream.
+    test_wm21_legitimate_request_to_bound_host_is_injected) return 0 ;;
+    test_wm21_case_and_trailing_dot_are_not_a_disagreement) return 0 ;;
+    test_wm21_matching_unbound_host_passes_untouched) return 0 ;;
+    test_wm21_disagreeing_unbound_hosts_pass_untouched) return 0 ;;
+    test_wm21_no_vault_leaves_traffic_alone) return 0 ;;
+    # WM-21, transparent mode: an address the bound name resolves to still gets the
+    # credential (Host and destination agreeing in substance), and unbound transparent
+    # traffic is never touched -- both true on upstream, which injects on Host alone.
+    test_wm21_transparent_destination_the_bound_name_resolves_to_is_injected) return 0 ;;
+    test_wm21_transparent_ipv4_mapped_destination_matches_its_ipv4) return 0 ;;
+    test_wm21_transparent_unbound_traffic_passes_untouched) return 0 ;;
     TestWM7StillSleepsWhenSomethingWasSignalled) return 0 ;;
     # No seed given means no variable on the sidecar -- the unchanged default, which must
     # hold on upstream too, where the field does not exist at all.
@@ -480,7 +494,7 @@ record() {
   return 0
 }
 
-check_py() { # <id> <test file, relative to server/> <exact test name>
+check_py() { # <id> <test file, relative to server/ (../ for another component)> <exact test name>
   local xml out verdict
   xml=$(mktemp "$work/junit.XXXXXX")
   run_py "$2" "$3" "$xml" >/dev/null || true
@@ -533,7 +547,7 @@ copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
 # Both use only upstream symbols, so on upstream they compile and fail on behaviour.
 copy kubernetes/internal/utils/expectations/resource_version_expectation_wm20_test.go
 copy kubernetes/internal/controller/batchsandbox_status_stale_view_test.go
-# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19.
+# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
 copy server/tests/test_runtime_resolver.py
@@ -549,6 +563,8 @@ copy server/tests/k8s/test_informer_quiet_fallback.py
 copy server/tests/k8s/test_provider_common.py
 copy server/tests/test_wm18_owner_subject.py
 copy server/tests/test_wm19_proxy_revalidation.py
+# WM-21: the credential proxy addon's own tests, run against upstream's system.py.
+copy components/egress/tests/test_mitmscripts_system.py
 
 # Module and package of a Go test file, from the nearest go.mod above it.
 go_package() { # <path> -> "<module dir> <package>"
@@ -583,6 +599,12 @@ while read -r id path name; do
     server/tests/*.py)
       py_total=$((py_total + 1))
       check_py "$id" "${path#server/}" "$name"
+      ;;
+    components/egress/tests/test_*.py)
+      # The egress mitmscripts' tests are stdlib-only (the addon runs against a fake
+      # mitmproxy), so server/'s environment runs them; the path is given from there.
+      py_total=$((py_total + 1))
+      check_py "$id" "../$path" "$name"
       ;;
     *)
       # Declared, so hack/wm-check.sh counts it -- but this gate runs pytest only in

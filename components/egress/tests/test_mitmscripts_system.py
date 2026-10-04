@@ -2324,6 +2324,284 @@ class SystemAddonStreamingTest(unittest.TestCase):
         self.assertNotIn("x-api-key", flow.request.headers._values)
 
 
+class SystemAddonDestinationHostTest(unittest.TestCase):
+    """WM-21: a binding is decided on the host the connection goes to, not on the
+    ``Host`` header the client wrote."""
+
+    def _system(self, schemes=None):
+        system = _load_system_module()
+        match_schemes = {"schemes": schemes} if schemes else {}
+        system._load_active_vault = lambda _client_ip=None: system.ActiveVault(
+            1,
+            [
+                {
+                    "name": "gateway",
+                    "match": {
+                        **match_schemes,
+                        "hosts": ["gateway.wm.internal", "*.bound.example"],
+                        "methods": ["GET"],
+                        "paths": ["/*"],
+                    },
+                    "headers": [{"name": "Authorization", "value": "Bearer synthetic-key"}],
+                }
+            ],
+            ["Bearer synthetic-key"],
+        )
+        return system
+
+    @staticmethod
+    def _flow(destination: str, host_header: str) -> _Flow:
+        flow = _Flow()
+        flow.response = None
+        flow.request.host = destination
+        flow.request.pretty_host = host_header
+        flow.request.path = "/"
+        flow.request.headers["Content-Length"] = "0"
+        return flow
+
+    def test_wm21_spoofed_host_header_gets_no_credential_and_is_refused(self) -> None:
+        system = self._system()
+        flow = self._flow("203.0.113.9", "gateway.wm.internal")
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertNotIn(system.FLOW_BINDING_KEY, flow.metadata)
+        self.assertIsNotNone(flow.response)
+        self.assertEqual(403, flow.response.status_code)
+
+    def test_wm21_spoofed_wildcard_host_header_is_refused(self) -> None:
+        system = self._system()
+        flow = self._flow("203.0.113.9", "api.bound.example")
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertEqual(403, flow.response.status_code)
+
+    def test_wm21_bound_destination_with_foreign_host_header_is_refused(self) -> None:
+        """The probe the other way round: connect to a bound host, name another."""
+        system = self._system()
+        flow = self._flow("gateway.wm.internal", "other.example")
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertEqual(403, flow.response.status_code)
+
+    def test_wm21_streamed_spoof_is_killed_not_forwarded(self) -> None:
+        system = self._system()
+        flow = self._flow("203.0.113.9", "gateway.wm.internal")
+        flow.request.stream = True
+
+        system.requestheaders(flow)
+
+        self.assertTrue(flow.killed)
+        self.assertNotIn("Authorization", flow.request.headers)
+
+    def test_wm21_legitimate_request_to_bound_host_is_injected(self) -> None:
+        system = self._system()
+        flow = self._flow("gateway.wm.internal", "gateway.wm.internal")
+        flow.request.port = 443
+
+        system.requestheaders(flow)
+
+        self.assertEqual("Bearer synthetic-key", flow.request.headers.get("Authorization"))
+        self.assertIsNone(flow.response)
+
+    def test_wm21_case_and_trailing_dot_are_not_a_disagreement(self) -> None:
+        system = self._system()
+        flow = self._flow("gateway.wm.internal.", "GATEWAY.wm.internal")
+
+        system.requestheaders(flow)
+
+        self.assertEqual("Bearer synthetic-key", flow.request.headers.get("Authorization"))
+
+    def test_wm21_matching_unbound_host_passes_untouched(self) -> None:
+        system = self._system()
+        flow = self._flow("203.0.113.9", "203.0.113.9")
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertIsNone(flow.response)
+        self.assertFalse(flow.killed)
+
+    def test_wm21_disagreeing_unbound_hosts_pass_untouched(self) -> None:
+        """Neither name carries a credential, so nothing is at risk and ordinary
+        egress (virtual hosting by IP, for one) is not changed."""
+        system = self._system()
+        flow = self._flow("203.0.113.9", "app.example.org")
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertIsNone(flow.response)
+
+    def test_wm21_every_request_is_decided_afresh(self) -> None:
+        """A redirect, or a second request on a kept-alive client connection,
+        is a new flow: a good request does not vouch for the spoofed one after it."""
+        system = self._system()
+        good = self._flow("gateway.wm.internal", "gateway.wm.internal")
+        system.requestheaders(good)
+        self.assertEqual("Bearer synthetic-key", good.request.headers.get("Authorization"))
+
+        redirected = self._flow("203.0.113.9", "gateway.wm.internal")
+        system.requestheaders(redirected)
+        self.assertNotIn("Authorization", redirected.request.headers)
+        self.assertEqual(403, redirected.response.status_code)
+
+    def test_wm21_no_vault_leaves_traffic_alone(self) -> None:
+        system = _load_system_module()
+        system._load_active_vault = lambda _client_ip=None: None
+        flow = self._flow("203.0.113.9", "gateway.wm.internal")
+
+        system.requestheaders(flow)
+
+        self.assertIsNone(flow.response)
+
+    # Transparent mode: the destination is an address (SO_ORIGINAL_DST) and the
+    # name is only in Host and SNI.
+    @staticmethod
+    def _transparent(flow: _Flow, sni: str | None) -> _Flow:
+        flow.client_conn = types.SimpleNamespace(
+            proxy_mode=types.SimpleNamespace(type_name="transparent"),
+            sni=sni,
+            peername=("10.10.0.5", 40000),
+        )
+        return flow
+
+    @staticmethod
+    def _resolving(system, mapping: dict[str, set[str]]) -> list[str]:
+        asked: list[str] = []
+
+        def resolve(name: str) -> frozenset[str]:
+            asked.append(name)
+            return frozenset(mapping.get(name, set()))
+
+        system._resolve_host_addresses = resolve
+        return asked
+
+    def test_wm21_transparent_destination_the_bound_name_resolves_to_is_injected(self) -> None:
+        system = self._system(["http", "https"])
+        self._resolving(system, {"gateway.wm.internal": {"10.99.0.2"}})
+        for scheme, port, sni in (("http", 80, None), ("https", 443, "gateway.wm.internal")):
+            with self.subTest(scheme=scheme):
+                flow = self._transparent(self._flow("10.99.0.2", "gateway.wm.internal"), sni)
+                flow.request.scheme = scheme
+                flow.request.port = port
+
+                system.requestheaders(flow)
+
+                self.assertEqual(
+                    "Bearer synthetic-key", flow.request.headers.get("Authorization")
+                )
+                self.assertIsNone(flow.response)
+
+    def test_wm21_transparent_destination_outside_the_resolved_set_is_refused(self) -> None:
+        system = self._system(["http", "https"])
+        self._resolving(system, {"gateway.wm.internal": {"10.99.0.2"}})
+        flow = self._transparent(self._flow("203.0.113.9", "gateway.wm.internal"), None)
+        flow.request.scheme = "http"
+        flow.request.port = 80
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertEqual(403, flow.response.status_code)
+
+    def test_wm21_transparent_unresolvable_bound_name_is_refused(self) -> None:
+        system = self._system(["http", "https"])
+        self._resolving(system, {})
+        flow = self._transparent(self._flow("10.99.0.2", "gateway.wm.internal"), None)
+        flow.request.scheme = "http"
+        flow.request.port = 80
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertEqual(403, flow.response.status_code)
+
+    def test_wm21_transparent_tls_needs_sni_to_name_the_bound_host(self) -> None:
+        system = self._system()
+        self._resolving(system, {"gateway.wm.internal": {"10.99.0.2"}})
+        for sni in (None, "other.example", "10.99.0.2"):
+            with self.subTest(sni=sni):
+                flow = self._transparent(self._flow("10.99.0.2", "gateway.wm.internal"), sni)
+                flow.request.port = 443
+
+                system.requestheaders(flow)
+
+                self.assertNotIn("Authorization", flow.request.headers)
+                self.assertEqual(403, flow.response.status_code)
+
+    def test_wm21_transparent_ipv4_mapped_destination_matches_its_ipv4(self) -> None:
+        system = self._system()
+        self._resolving(system, {"gateway.wm.internal": {"10.99.0.2"}})
+        flow = self._transparent(
+            self._flow("::ffff:10.99.0.2", "gateway.wm.internal"), "gateway.wm.internal"
+        )
+        flow.request.port = 443
+
+        system.requestheaders(flow)
+
+        self.assertEqual("Bearer synthetic-key", flow.request.headers.get("Authorization"))
+
+    def test_wm21_transparent_unbound_traffic_passes_untouched(self) -> None:
+        system = self._system(["http", "https"])
+        asked = self._resolving(system, {})
+        for host_header in ("app.example.org", "10.99.0.2"):
+            with self.subTest(host=host_header):
+                flow = self._transparent(self._flow("10.99.0.2", host_header), None)
+                flow.request.scheme = "http"
+                flow.request.port = 80
+
+                system.requestheaders(flow)
+
+                self.assertNotIn("Authorization", flow.request.headers)
+                self.assertIsNone(flow.response)
+                self.assertFalse(flow.killed)
+        self.assertEqual([], asked, "unbound traffic must not cost a lookup")
+
+    def test_wm21_regular_mode_still_refuses_an_address_destination_with_a_bound_host(self) -> None:
+        """The address exception belongs to transparent mode only."""
+        system = self._system(["http", "https"])
+        self._resolving(system, {"gateway.wm.internal": {"203.0.113.9"}})
+        flow = self._flow("203.0.113.9", "gateway.wm.internal")
+        flow.client_conn = types.SimpleNamespace(
+            proxy_mode=types.SimpleNamespace(type_name="regular"),
+            sni=None,
+            peername=("10.10.0.5", 40000),
+        )
+
+        system.requestheaders(flow)
+
+        self.assertNotIn("Authorization", flow.request.headers)
+        self.assertEqual(403, flow.response.status_code)
+
+    def test_resolver_reads_the_sidecars_getaddrinfo_and_fails_closed(self) -> None:
+        system = _load_system_module()
+        calls: list[str] = []
+
+        def fake_getaddrinfo(name, *args):
+            calls.append(name)
+            if name == "down.example":
+                raise OSError("no resolver")
+            return [(2, 1, 6, "", ("10.99.0.2", 0)), (10, 1, 6, "", ("::ffff:10.99.0.3", 0, 0, 0))]
+
+        real = system.socket.getaddrinfo
+        system.socket.getaddrinfo = fake_getaddrinfo
+        try:
+            self.assertEqual(
+                frozenset({"10.99.0.2", "10.99.0.3"}), system._resolve_host_addresses("ok.example")
+            )
+            system._resolve_host_addresses("ok.example")
+            self.assertEqual(["ok.example"], calls, "a success is cached briefly")
+            self.assertEqual(frozenset(), system._resolve_host_addresses("down.example"))
+        finally:
+            system.socket.getaddrinfo = real
+
+
 class SystemAddonTlsClientHelloTest(unittest.TestCase):
     def _client_hello_data(self, sni: str | None) -> Any:
         class _ClientHello:

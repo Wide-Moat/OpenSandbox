@@ -61,6 +61,9 @@ import json
 import os
 import re
 import socket
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from typing import Any, NoReturn
 from urllib.parse import quote, quote_plus, unquote
@@ -75,6 +78,7 @@ FLOW_REDACTIONS_KEY = "opensandbox_credential_redactions"
 FLOW_BINDING_KEY = "opensandbox_credential_binding"
 FLOW_VAULT_REDACTIONS_KEY = "opensandbox_credential_vault_redactions"
 FLOW_REJECTION_KEY = "opensandbox_credential_rejected"
+FLOW_BINDING_HOST_KEY = "opensandbox_credential_binding_host"
 HEADER_SUBSTITUTION_DENYLIST = {
     "host",
     "content-length",
@@ -665,8 +669,136 @@ def _validate_active_vault_etag(value: str | None) -> str:
 
 
 def _request_host(flow: http.HTTPFlow) -> str:
+    """The host the connection goes to: the absolute-URI host in regular mode,
+    the CONNECT target in a tunnel. Never the ``Host`` header, which the client
+    chooses independently of where mitmproxy connects.
+
+    The one exception is a transparent-mode flow whose destination is an
+    address: the name is then only in ``Host``/SNI, and ``_guard_binding_host``
+    records it here only after proving the address belongs to that name."""
+    verified = flow.metadata.get(FLOW_BINDING_HOST_KEY)
+    if verified:
+        return verified
+    host = flow.request.host or ""
+    return host.rstrip(".").lower()
+
+
+def _claimed_host(flow: http.HTTPFlow) -> str:
+    """The host the request CLAIMS by its ``Host`` header (``:authority`` on
+    HTTP/2). Equal to the destination unless the client says otherwise."""
     host = flow.request.pretty_host or flow.request.host or ""
     return host.rstrip(".").lower()
+
+
+def _is_transparent(flow: http.HTTPFlow) -> bool:
+    """True if the client connection arrived through a transparent listener
+    (SO_ORIGINAL_DST), where the destination is an address and the name exists
+    only in the ``Host`` header and SNI. Decided from the flow's own proxy
+    mode, not from configuration; anything unknown is treated as regular, the
+    strict rule."""
+    mode = getattr(getattr(flow, "client_conn", None), "proxy_mode", None)
+    return getattr(mode, "type_name", None) == "transparent"
+
+
+def _normalized_ip(value: str) -> str | None:
+    try:
+        ip = ipaddress.ip_address(value.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip)
+
+
+_RESOLVE_TTL_SECONDS = 30.0
+_RESOLVE_TIMEOUT_SECONDS = 2.0
+_resolve_cache: dict[str, tuple[float, frozenset[str]]] = {}
+_resolve_lock = threading.Lock()
+_resolver_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wm-resolve")
+
+
+def _resolve_host_addresses(name: str) -> frozenset[str]:
+    """Addresses ``name`` resolves to through the sidecar's own resolver. Empty
+    on any failure, which callers treat as "not proven". Only successes are
+    cached, and briefly."""
+    now = time.monotonic()
+    with _resolve_lock:
+        cached = _resolve_cache.get(name)
+        if cached is not None and now - cached[0] < _RESOLVE_TTL_SECONDS:
+            return cached[1]
+    try:
+        infos = _resolver_pool.submit(
+            socket.getaddrinfo, name, None, 0, socket.SOCK_STREAM
+        ).result(timeout=_RESOLVE_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 - unresolved means unproven
+        return frozenset()
+    addresses = frozenset(
+        filter(None, (_normalized_ip(str(info[4][0])) for info in infos))
+    )
+    if addresses:
+        with _resolve_lock:
+            _resolve_cache[name] = (now, addresses)
+    return addresses
+
+
+def _guard_binding_host(flow: http.HTTPFlow, vault: ActiveVault) -> bool:
+    """Decide whose name a request may use. True means go on to binding
+    selection; False means the request was refused here.
+
+    Regular proxy (absolute URI, CONNECT): the destination is a host name the
+    proxy connects to, and the ``Host`` header must agree with it whenever
+    either is covered by a binding.
+
+    Transparent: the destination is an address. A binding's name is honoured
+    only if that address is one the name resolves to and, over TLS, the client
+    asked for that name in SNI; otherwise the request is refused, so a client
+    cannot connect anywhere with ``Host: <bound name>`` and be handed the
+    credential. Requests naming nothing a binding covers are left alone."""
+    destination = _request_host(flow)
+    claimed = _claimed_host(flow)
+    if destination == claimed:
+        return True
+
+    if _is_transparent(flow) and _normalized_ip(destination) is not None:
+        if not _host_names_a_binding(vault, claimed):
+            return True
+        reason = None
+        if (flow.request.scheme or "").lower() == "https":
+            sni = (getattr(getattr(flow, "client_conn", None), "sni", None) or "")
+            if sni.rstrip(".").lower() != claimed:
+                reason = "SNI does not name the bound host"
+        if reason is None and _normalized_ip(destination) not in _resolve_host_addresses(claimed):
+            reason = "destination address is not one the bound host resolves to"
+        if reason is None:
+            flow.metadata[FLOW_BINDING_HOST_KEY] = claimed
+            return True
+        _reject_request(flow, b"host header does not match request destination\n")
+        ctx.log.warn(
+            f"credential proxy: rejected transparent request: {reason}: "
+            f"destination={destination} host_header={claimed}"
+        )
+        return False
+
+    if _host_names_a_binding(vault, destination) or _host_names_a_binding(vault, claimed):
+        _reject_request(flow, b"host header does not match request destination\n")
+        ctx.log.warn(
+            "credential proxy: rejected request whose Host header names a "
+            f"different host than its destination: destination={destination} "
+            f"host_header={claimed}"
+        )
+        return False
+    return True
+
+
+def _host_names_a_binding(vault: ActiveVault, host: str) -> bool:
+    """True if any binding's host selectors cover ``host``, whatever its scheme,
+    port, method or path -- the question is whether a credential exists that
+    this name could be used to get or to probe for."""
+    for binding in vault.bindings:
+        for pattern in (binding.get("match") or {}).get("hosts") or []:
+            if _host_matches(host, pattern)[0]:
+                return True
+    return False
 
 
 def _request_port(flow: http.HTTPFlow) -> int:
@@ -1153,6 +1285,15 @@ def requestheaders(flow: http.HTTPFlow) -> None:
         return
     _observe_tls_shadow(flow, vault)
     if vault is None:
+        return
+
+    # A binding is decided on the host the connection goes to, so a ``Host``
+    # header cannot move a credential to another server. A request whose
+    # header disagrees with its destination is refused when either name is one
+    # a binding covers: it can only be an attempt to get the credential sent
+    # elsewhere, or to learn which hosts have one. Unbound names on both sides
+    # are ordinary egress traffic and stay untouched.
+    if not _guard_binding_host(flow, vault):
         return
 
     # Requests outside credential binding scope are ordinary egress traffic.
