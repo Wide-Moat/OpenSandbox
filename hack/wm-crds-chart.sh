@@ -76,8 +76,11 @@ n=$(cd "$crds" && cat "${files[@]}" | grep -c '^kind: CustomResourceDefinition$'
 
 base=$(awk '$1 == "version:" { print $2; exit }' "$base_chart" | tr -d "\"'")
 version="${base}-g${sha7}"
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-g[0-9a-f]{7}$ ]] \
-  || fail "'$version' is not <major.minor.patch>-g<sha7> -- $base_chart has version '$base'"
+# The controller chart's own version may already be a pre-release (upstream's 1.1.1-rc.1), and
+# "-g<sha7>" then extends it: "1.1.1-rc.1-gabc1234" is still one semver pre-release, its last
+# identifier "1-gabc1234". Refusing it stopped every publish the day upstream cut an rc.
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?-g[0-9a-f]{7}$ ]] \
+  || fail "'$version' is not <major.minor.patch[-pre-release]>-g<sha7> -- $base_chart has version '$base'"
 
 # same <package.tgz> <label>: the package is this version and holds exactly the source's CRDs,
 # byte for byte, and helm renders every one of them. Checked on the package before it is pushed
