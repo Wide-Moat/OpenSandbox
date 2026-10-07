@@ -102,3 +102,13 @@ To find affected sandboxes:
 ```bash
 kubectl get events --field-selector reason=ReplacedStuckPod,reason=PodRecoveryLimitReached,reason=ImagePullPermanentFailure
 ```
+
+## Optional completed-sandbox cleanup
+
+Set `controller.endedSandboxGrace: "10m"` in the controller chart to enable cleanup of non-pooled BatchSandboxes whose declared workloads have all terminated beyond that grace. The value is hot-reloaded through `feature-flags` as `ended-sandbox-grace`; missing, zero, negative or malformed values disable cleanup. Leader election is required; enabling cleanup without it fails the reconciliation explicitly.
+
+The lifecycle reconciler makes the cleanup decision before recovery and scaling, using uncached parent and pod reads. Pending provisioning failures retain their recovery opportunity until the replacement budget is exhausted. Missing pods, active pods, deleting pods, incomplete finish timestamps, and pause/resume transitions are not eligible. Parent deletion carries UID and resourceVersion preconditions. Home PVCs are not deleted by this operation.
+
+Do not run an independent reaper that deletes BatchSandboxes from pod snapshots alongside this controller. A parent UID does not change when recovery replaces a child pod, so that pattern can delete a live replacement. Volume retention may remain in its existing reaper. Enable the controller feature only after removing the conflicting sandbox deletion loop and its unnecessary permission in the coordinated release. Ordinary expiry continues to follow its existing contract.
+
+Acceptance requires both a recoverable terminal pod that is replaced without losing its parent and a completed sandbox that is removed after grace while its home claim remains. Unit integration coverage uses a real envtest API; live deployment acceptance remains separate.

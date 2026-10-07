@@ -1,4 +1,4 @@
-{{- if .Values.controller.podRecovery }}
+{{- if or .Values.controller.podRecovery .Values.controller.endedSandboxGrace }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,13 +7,18 @@ metadata:
     {{- include "opensandbox.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller-manager
 data:
-  {{- with .Values.controller.podRecovery.stuckThreshold }}
+  {{- with .Values.controller.endedSandboxGrace }}
+  ended-sandbox-grace: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.controller.podRecovery }}
+  {{- with .stuckThreshold }}
   pod-recovery-stuck-threshold: {{ . | quote }}
   {{- end }}
-  {{- with .Values.controller.podRecovery.maxAttempts }}
+  {{- with .maxAttempts }}
   pod-recovery-max-attempts: {{ . | quote }}
   {{- end }}
-  {{- with .Values.controller.podRecovery.admissionReasons }}
+  {{- with .admissionReasons }}
   pod-recovery-admission-reasons: {{ . | quote }}
+  {{- end }}
   {{- end }}
 {{- end }}

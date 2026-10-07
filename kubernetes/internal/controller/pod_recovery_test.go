@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -269,6 +270,103 @@ func TestReconcilePodRecovery(t *testing.T) {
 		syncObject(pod)
 		return h
 	}
+
+	t.Run("ended cleanup keeps recovery and replacement under the same parent", func(t *testing.T) {
+		h := setup(t, "cleanup-recovery")
+		h.r.FeatureConfig.Load(map[string]string{"ended-sandbox-grace": "10m"})
+		h.r.APIReader = apiClient
+		h.r.LeaderElectionEnabled = true
+		h.pod.Status.Phase = corev1.PodFailed
+		h.pod.Status.Reason = "Evicted"
+		h.pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "main", Image: "busybox:latest",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, FinishedAt: metav1.NewTime(time.Now().Add(-20 * time.Minute))}}}}
+		require.NoError(t, apiClient.Status().Update(testContext, h.pod))
+		h.sync(h.pod)
+		h.r.podRecoveryNow = func() time.Time { return time.Now().Add(20 * time.Minute) }
+		parentUID := h.bs.UID
+		h.reconcile()
+		require.Eventually(t, func() bool {
+			return apierrors.IsNotFound(apiClient.Get(testContext, client.ObjectKeyFromObject(h.pod), &corev1.Pod{}))
+		}, 5*time.Second, 20*time.Millisecond)
+		h.reconcile()
+		replacement := &corev1.Pod{}
+		require.Eventually(t, func() bool { return apiClient.Get(testContext, client.ObjectKeyFromObject(h.pod), replacement) == nil }, 5*time.Second, 20*time.Millisecond)
+		require.NotEqual(t, h.pod.UID, replacement.UID)
+		h.sync(replacement)
+		h.reconcile()
+		require.Equal(t, parentUID, h.bs.UID)
+		require.Nil(t, h.bs.DeletionTimestamp)
+	})
+
+	t.Run("ended cleanup removes completed sandbox after grace", func(t *testing.T) {
+		h := setup(t, "cleanup-completed")
+		home := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "cleanup-home", Namespace: "default"}, Spec: corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}}}}
+		require.NoError(t, apiClient.Create(testContext, home))
+		h.r.FeatureConfig.Load(map[string]string{"ended-sandbox-grace": "10m"})
+		h.r.APIReader = apiClient
+		h.r.LeaderElectionEnabled = true
+		h.pod.Status.Phase = corev1.PodSucceeded
+		h.pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "main", Image: "busybox:latest",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, FinishedAt: metav1.NewTime(time.Now().Add(-20 * time.Minute))}}}}
+		require.NoError(t, apiClient.Status().Update(testContext, h.pod))
+		h.sync(h.pod)
+		h.sync(h.bs)
+		_, err := h.r.Reconcile(testContext, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(h.bs)})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return apierrors.IsNotFound(apiClient.Get(testContext, client.ObjectKeyFromObject(h.bs), &sandboxv1alpha1.BatchSandbox{}))
+		}, time.Second, 20*time.Millisecond)
+		require.NoError(t, apiClient.Get(testContext, client.ObjectKeyFromObject(home), &corev1.PersistentVolumeClaim{}))
+	})
+
+	t.Run("ended cleanup retains recent incomplete and paused workloads", func(t *testing.T) {
+		for _, name := range []string{"recent", "undated", "missing", "paused", "changed-generation", "deleting"} {
+			t.Run(name, func(t *testing.T) {
+				h := setup(t, "cleanup-guard-"+name)
+				h.r.FeatureConfig.Load(map[string]string{"ended-sandbox-grace": "10m"})
+				h.r.APIReader = apiClient
+				h.r.LeaderElectionEnabled = true
+				finished := metav1.NewTime(time.Now().Add(-20 * time.Minute))
+				if name == "recent" {
+					finished = metav1.NewTime(time.Now())
+				}
+				if name == "undated" {
+					finished = metav1.Time{}
+				}
+				h.pod.Status.Phase = corev1.PodSucceeded
+				h.pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "main", Image: "busybox:latest", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{FinishedAt: finished}}}}
+				if name == "missing" {
+					h.pod.Status.ContainerStatuses = nil
+				}
+				require.NoError(t, apiClient.Status().Update(testContext, h.pod))
+				if name == "paused" {
+					h.bs.Status.Phase = sandboxv1alpha1.BatchSandboxPhasePaused
+					require.NoError(t, apiClient.Status().Update(testContext, h.bs))
+				}
+				if name == "deleting" {
+					h.bs.Finalizers = []string{finalizerTaskCleanup}
+					require.NoError(t, apiClient.Update(testContext, h.bs))
+					require.NoError(t, apiClient.Delete(testContext, h.bs))
+					require.NoError(t, apiClient.Get(testContext, client.ObjectKeyFromObject(h.bs), h.bs))
+				}
+				observed := h.bs.DeepCopy()
+				if name == "changed-generation" {
+					observed.Generation--
+				}
+				handled, wait, err := h.r.cleanupEndedSandbox(testContext, observed)
+				require.NoError(t, err)
+				if name == "recent" {
+					require.Greater(t, wait, time.Duration(0))
+				}
+				require.NoError(t, apiClient.Get(testContext, client.ObjectKeyFromObject(h.bs), h.bs))
+				if name == "deleting" {
+					require.False(t, handled, "cleanup must allow existing task finalization to continue")
+				} else {
+					require.Nil(t, h.bs.DeletionTimestamp)
+				}
+			})
+		}
+	})
 
 	t.Run("replaces stuck pod and recreates from template", func(t *testing.T) {
 		h := setup(t, "recovery-replace")
