@@ -76,6 +76,10 @@ type taskScheduleResult struct {
 // BatchSandboxReconciler reconciles a BatchSandbox object
 type BatchSandboxReconciler struct {
 	client.Client
+	// LeaderElectionEnabled gates optional cleanup to the elected manager.
+	LeaderElectionEnabled bool
+	// APIReader bypasses the cache for destructive lifecycle decisions.
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	Recorder            record.EventRecorder
 	ProfileStore        *poolassign.ProfileStore
@@ -218,6 +222,13 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		utils.WithPodIndexSorter(podIndex),
 		utils.PodNameSorter,
 	}).Sort)
+	if !poolStrategy.IsPooledMode() {
+		if handled, wait, err := r.cleanupEndedSandbox(ctx, batchSbx); handled || err != nil {
+			return ctrl.Result{RequeueAfter: wait}, err
+		} else if wait > 0 {
+			durationStore.Push(req.String(), wait)
+		}
+	}
 	// Normal mode owns pod lifecycle except while a sandbox is fully paused. In Paused, the
 	// snapshot-backed runtime is quiesced and pods must stay absent until resume rewrites the
 	// template images and transitions back through Resuming.
@@ -820,6 +831,9 @@ func (r *BatchSandboxReconciler) assignPool(ctx context.Context, batchSbx *sandb
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *BatchSandboxReconciler) SetupWithManager(mgr ctrl.Manager, maxConcurrentReconciles int) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1alpha1.BatchSandbox{}).
 		Named("batchsandbox").

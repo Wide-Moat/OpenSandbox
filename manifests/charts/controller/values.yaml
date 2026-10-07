@@ -111,6 +111,10 @@ controller:
     # -- Secret name injected into resumed sandboxes for pulling snapshot images.
     resumePullSecret: ""
 
+  # -- Optional terminal sandbox cleanup grace (for example "10m"). Empty disables it.
+  # Requires leader election; homes remain under independent volume retention.
+  endedSandboxGrace: ""
+
   # -- Enable leader election for controller manager
   leaderElection:
     enabled: true
