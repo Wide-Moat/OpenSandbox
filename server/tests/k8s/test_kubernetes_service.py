@@ -392,7 +392,9 @@ class TestKubernetesSandboxServiceCreate:
             egress_settings.otlp_endpoint == "http://otel-collector.observability:4318"
         )
         assert egress_settings.env == {"OPENSANDBOX_EGRESS_LOG_LEVEL": "debug"}
-        assert kwargs["env"] == {"SANDBOX_ENV": "value"}
+        # The execd token is the server's, alongside the caller's own variables.
+        assert set(kwargs["env"]) == {"SANDBOX_ENV", "EXECD_ACCESS_TOKEN"}
+        assert kwargs["env"]["SANDBOX_ENV"] == "value"
         assert "network_policy" not in kwargs
         assert kwargs["annotations"][SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY] == "egress-token"
 

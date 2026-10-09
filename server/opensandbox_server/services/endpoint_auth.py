@@ -39,6 +39,11 @@ def build_egress_auth_headers(token: str) -> dict[str, str]:
     return {OPEN_SANDBOX_EGRESS_AUTH_HEADER: token}
 
 
+def generate_execd_access_token() -> str:
+    """Return a random URL-safe token for execd's own API."""
+    return secrets.token_urlsafe(SECURE_ACCESS_TOKEN_BYTES)
+
+
 def build_secure_access_headers(token: str) -> dict[str, str]:
     """Build endpoint headers for sandbox secure access."""
     return {OPEN_SANDBOX_SECURE_ACCESS_HEADER: token}
@@ -61,5 +66,6 @@ __all__ = [
     "build_secure_access_headers",
     "generate_egress_token",
     "generate_secure_access_token",
+    "generate_execd_access_token",
     "merge_endpoint_headers",
 ]

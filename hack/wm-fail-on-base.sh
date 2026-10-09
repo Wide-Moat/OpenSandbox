@@ -206,6 +206,9 @@ is_guard() {
     # No seed given means no variable on the sidecar -- the unchanged default, which must
     # hold on upstream too, where the field does not exist at all.
     test_wm8_no_seed_is_the_default) return 0 ;;
+    # No execd token when it is switched off -- upstream never issues one, so this holds
+    # there; without it the token could be issued unconditionally and the others would pass.
+    test_wm23_switched_off_no_token_is_issued) return 0 ;;
     # WM-8 split the vault's readiness in two for the seed; the API must still wait for
     # mitmdump, as upstream's does.
     TestWM8TheAPIStillWaitsForTheCredentialProxy) return 0 ;;
@@ -547,7 +550,7 @@ copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
 # Both use only upstream symbols, so on upstream they compile and fail on behaviour.
 copy kubernetes/internal/utils/expectations/resource_version_expectation_wm20_test.go
 copy kubernetes/internal/controller/batchsandbox_status_stale_view_test.go
-# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21.
+# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21, WM-23.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
 copy server/tests/test_runtime_resolver.py
@@ -563,6 +566,9 @@ copy server/tests/k8s/test_informer_quiet_fallback.py
 copy server/tests/k8s/test_provider_common.py
 copy server/tests/test_wm18_owner_subject.py
 copy server/tests/test_wm19_proxy_revalidation.py
+# WM-23: execd's token, written with upstream symbols only (string literals for the new
+# constants). The helper unit tests in test_execd_access_token.py are not WM tests.
+copy server/tests/k8s/test_wm23_execd_token_behaviour.py
 # WM-21: the credential proxy addon's own tests, run against upstream's system.py.
 copy components/egress/tests/test_mitmscripts_system.py
 

@@ -1187,6 +1187,19 @@ class RuntimeConfig(BaseModel):
         ),
         min_length=1,
     )
+    execd_access_token: bool = Field(
+        default=True,
+        description=(
+            "Kubernetes: give every sandbox's execd its own access token "
+            "(EXECD_ACCESS_TOKEN in the sandbox container, recorded in the "
+            "opensandbox.io/execd-access-token annotation). execd then refuses any "
+            "request without it except /ping, /ready and /internal/init, and the "
+            "server adds it to every request it resolves for the execd port, so "
+            "its proxy is unaffected. Without it execd answers anyone who can "
+            "reach the pod, and the network policy is the only lock. Pool-mode "
+            "sandboxes are started before a request exists and get none."
+        ),
+    )
     execd_run_as_init: bool = Field(
         default=False,
         description=(

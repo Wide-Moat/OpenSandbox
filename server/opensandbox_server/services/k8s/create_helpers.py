@@ -26,6 +26,8 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_LIFECYCLE,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_SECURE_ACCESS_TOKEN_METADATA_KEY,
+    SANDBOX_EXECD_ACCESS_TOKEN_METADATA_KEY,
+    EXECD_ACCESS_TOKEN_ENV,
     SANDBOX_ID_LABEL,
     SANDBOX_MANUAL_CLEANUP_LABEL,
     SANDBOX_SNAPSHOT_ID_LABEL,
@@ -60,6 +62,7 @@ def _build_create_workload_context(
     created_at: datetime,
     egress_token_factory: Callable[[], str],
     secure_access_token_factory: Callable[[], str],
+    execd_access_token_factory: Optional[Callable[[], str]] = None,
 ) -> _CreateWorkloadContext:
     expires_at = None
     if request.timeout is not None:
@@ -96,6 +99,15 @@ def _build_create_workload_context(
         resource_requests = request.resource_requests.root
 
     sandbox_env, egress_env = split_egress_env(request.env)
+    # A caller cannot choose execd's token: one named in the request is dropped
+    # whether or not the server issues one, so a sandbox never runs execd under a
+    # credential its creator picked (and may have reused elsewhere).
+    sandbox_env.pop(EXECD_ACCESS_TOKEN_ENV, None)
+    if execd_access_token_factory is not None:
+        execd_access_token = execd_access_token_factory()
+        annotations[SANDBOX_EXECD_ACCESS_TOKEN_METADATA_KEY] = execd_access_token
+        sandbox_env[EXECD_ACCESS_TOKEN_ENV] = execd_access_token
+
     if request.lifecycle is not None:
         sandbox_env[OPENSANDBOX_LIFECYCLE] = request.lifecycle.model_dump_json(
             by_alias=True,
