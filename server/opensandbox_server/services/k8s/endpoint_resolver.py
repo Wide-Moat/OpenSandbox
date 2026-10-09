@@ -18,7 +18,10 @@ from typing import Any, Optional
 
 from opensandbox_server.api.schema import Endpoint
 from opensandbox_server.services.constants import (
+    EXECD_ACCESS_TOKEN_HEADER,
+    EXECD_PORT,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
+    SANDBOX_EXECD_ACCESS_TOKEN_METADATA_KEY,
     SANDBOX_SECURE_ACCESS_TOKEN_METADATA_KEY,
 )
 from opensandbox_server.services.endpoint_auth import (
@@ -68,4 +71,24 @@ def _attach_secure_access_headers(endpoint: Endpoint, workload: Any) -> None:
     endpoint.headers = merge_endpoint_headers(
         endpoint.headers,
         build_secure_access_headers(token),
+    )
+
+
+def _attach_execd_access_headers(endpoint: Endpoint, workload: Any, port: int) -> None:
+    """Add the sandbox's execd token to an endpoint resolved for the execd port.
+
+    The server proxy merges endpoint headers into the upstream request (replacing any
+    spelling the caller sent), so execd sees its token without the caller holding it.
+    A caller who asks for the endpoint itself gets the header to send -- the same
+    contract as the egress token on 18080. Only the execd port: nothing listening on
+    another port should ever be handed execd's credential.
+    """
+    if port != EXECD_PORT:
+        return
+    token = _get_annotation(workload, SANDBOX_EXECD_ACCESS_TOKEN_METADATA_KEY)
+    if not token:
+        return
+    endpoint.headers = merge_endpoint_headers(
+        endpoint.headers,
+        {EXECD_ACCESS_TOKEN_HEADER: token},
     )
