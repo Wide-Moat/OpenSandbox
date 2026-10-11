@@ -197,7 +197,7 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: github.ref == 'refs/heads/wm' && github.event_name != 'pull_request'
+        if: (github.ref == 'refs/heads/wm' && github.event_name != 'pull_request') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/wm-rebase-'))
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -217,8 +217,10 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           # Pushed only from the branch the images are built from. A pull request builds
-          # and discards, which still proves the Dockerfile works.
-          push: ${{ github.ref == 'refs/heads/wm' && github.event_name != 'pull_request' }}
+          # and discards, which still proves the Dockerfile works. The one other case is
+          # a manual dispatch on a wm-rebase-* branch: a rebase onto a new upstream release
+          # is proven by running its images before wm moves, and wm must not move first.
+          push: ${{ (github.ref == 'refs/heads/wm' && github.event_name != 'pull_request') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/wm-rebase-')) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # matrix.build-args is empty for every entry that does not set it, and an
