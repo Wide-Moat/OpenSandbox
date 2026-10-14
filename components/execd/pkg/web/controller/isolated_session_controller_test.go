@@ -448,7 +448,10 @@ func TestIsolatedDownloadFile_RangeHeader(t *testing.T) {
 		isolatedRunner = previousRunner
 	})
 
-	workspace := t.TempDir()
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(workspace, "data.bin"), []byte("0123456789"), 0o644); err != nil {
 		t.Fatal(err)
 	}
