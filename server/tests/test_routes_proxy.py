@@ -954,18 +954,13 @@ def test_proxy_forwards_get_request_with_query_params(
     assert fake_client.built["content"] is None
 
 
-def test_proxy_forwards_raw_query_string_unchanged(
-    client: TestClient,
-    auth_headers: dict,
-    monkeypatch,
-) -> None:
+def _record_backend_raw_paths(client: TestClient, monkeypatch) -> list[bytes]:
     class StubService:
         @staticmethod
         def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
-
     seen: list[bytes] = []
 
     class _Body(httpx.AsyncByteStream):
@@ -976,10 +971,16 @@ def test_proxy_forwards_raw_query_string_unchanged(
         seen.append(request.url.raw_path)
         return httpx.Response(200, stream=_Body())
 
-    _set_http_client(
-        client,
-        cast(Any, httpx.AsyncClient(transport=httpx.MockTransport(handler))),
-    )
+    _set_http_client(client, cast(Any, httpx.AsyncClient(transport=httpx.MockTransport(handler))))
+    return seen
+
+
+def test_proxy_forwards_raw_query_string_unchanged(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    seen = _record_backend_raw_paths(client, monkeypatch)
 
     # Repeated keys out of order, a valueless flag, a non-UTF-8 escape, a
     # literal ';' and a %20 space must all reach the backend byte for byte.
@@ -991,6 +992,66 @@ def test_proxy_forwards_raw_query_string_unchanged(
 
     assert response.status_code == 200
     assert seen == [f"/files/search?{raw_query}".encode("ascii")]
+
+
+@pytest.mark.parametrize("prefix", ["/v1", ""])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "api/contents/plain.txt?type=file",
+        "api/contents/a%2Fb",
+        "api/contents/a%3Fb.txt",
+        "api/contents/a%23b.txt?type=file",
+        "api/contents/100%25.txt",
+        "api/contents/caf%E9.txt",
+        "api/contents/a/%2E%2E/b",
+    ],
+)
+def test_proxy_forwards_encoded_path_unchanged(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+    prefix: str,
+    suffix: str,
+) -> None:
+    seen = _record_backend_raw_paths(client, monkeypatch)
+
+    response = client.get(f"{prefix}/sandboxes/sbx-123/proxy/8888/{suffix}", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert seen == [f"/{suffix}".encode("ascii")]
+
+
+def test_proxy_reencodes_decoded_path_when_raw_suffix_does_not_match(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    seen = _record_backend_raw_paths(client, monkeypatch)
+
+    # The encoded '/' in the sandbox id shifts the decoded match to port 8888,
+    # so the raw tail after the same number of '/' is not the matched suffix.
+    response = client.get(
+        "/v1/sandboxes/sbx%2Fproxy%2F8888/proxy/9999/x%3Fy",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert seen == [b"/proxy/9999/x%3Fy"]
+
+
+@pytest.mark.parametrize(
+    ("path", "query", "expected"),
+    [
+        ("a#frag", "x=1", "http://10.57.1.91:40109/a"),
+        ("a", "x=1#frag", "http://10.57.1.91:40109/a?x=1"),
+        ("a%23b", "x=1", "http://10.57.1.91:40109/a%23b?x=1"),
+    ],
+)
+def test_build_proxy_target_url_drops_raw_fragment(path: str, query: str, expected: str) -> None:
+    endpoint = Endpoint(endpoint="10.57.1.91:40109")
+
+    assert proxy_api._build_proxy_target_url(endpoint, path, query) == expected
 
 
 def test_proxy_forwards_delete_request_with_body(
@@ -1353,6 +1414,30 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
     assert lowered_headers["x-forwarded-for"] == "testclient"
     assert lowered_headers["opensandbox-ingress-to"] == "sbx-123-44772"
     assert lowered_headers["x-trace"] == "trace-ws"
+
+
+@pytest.mark.parametrize("suffix", ["ws/a%2Fb?token=abc", "ws/a%23b?token=abc"])
+def test_proxy_websocket_forwards_encoded_path_unchanged(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+    suffix: str,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            return Endpoint(endpoint="10.57.1.91:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    connector = _FakeWebSocketConnector(_FakeBackendWebSocket())
+    monkeypatch.setattr(proxy_api.websockets, "connect", connector)
+
+    with client.websocket_connect(
+        f"/v1/sandboxes/sbx-123/proxy/8888/{suffix}", headers=auth_headers
+    ) as websocket:
+        assert websocket.receive_text() == "backend-ready"
+
+    assert connector.calls[0]["uri"] == f"ws://10.57.1.91:40109/{suffix}"
 
 
 @pytest.mark.parametrize(
