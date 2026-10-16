@@ -48,6 +48,7 @@ from opensandbox_server.services.k8s.provider_common import (
 )
 from opensandbox_server.services.k8s.status_helpers import (
     POOL_CAPACITY_EXHAUSTED_REASON,
+    QUOTA_EXCEEDED_MESSAGE_MARKER,
 )
 from opensandbox_server.services.k8s.windows_profile import (
     apply_windows_profile_arch_selector,
@@ -103,6 +104,8 @@ class BatchSandboxProvider(WorkloadProvider):
         app_config: Optional[AppConfig] = None,
     ):
         self.k8s_client = k8s_client
+        # uids whose refused-pod lookup failed and was logged (pod_admission_refusal).
+        self._refusal_lookup_warned: set[str] = set()
         self.ingress_config = app_config.ingress if app_config else None
         self.egress_config = app_config.egress if app_config else None
 
@@ -963,6 +966,66 @@ class BatchSandboxProvider(WorkloadProvider):
             "last_transition_at": creation_timestamp,
         }
     
+    def pod_admission_refusal(self, workload: Dict[str, Any]) -> Optional[str]:
+        """The API server's quota refusal of this BatchSandbox's pod, if it gave one.
+
+        The BatchSandbox controller does not put a failed pod create on the CR's
+        status: it emits a ``FailedCreate`` Event on the BatchSandbox and retries
+        (``r.Recorder.Eventf(..., eventReasonFailedCreate, "failed to create pod:
+        %v, pod: %v", ...)`` in batchsandbox_controller.go). A ResourceQuota
+        refusal is therefore invisible to ``get_status``, and the caller waited out
+        the whole readiness budget for an answer the API server gave at once --
+        measured on a namespace at its quota: 60 s per create, all of it waiting for
+        a pod that could never exist.
+
+        Matched by the BatchSandbox's uid, so an Event of an earlier object with the
+        same name is never read, and only for the quota marker: any other
+        FailedCreate may be transient and keeps the caller polling. An Event
+        outlives the condition it reports -- the controller retries, and a retry
+        after quota frees up creates the pod -- so the refusal counts only while the
+        pod still does not exist. The message is cut before ``, pod:``, where the
+        controller appends the whole pod spec, and the marker is looked for in what
+        is left. Failing to read either is not a refusal.
+        """
+        metadata = workload.get("metadata", {})
+        namespace = metadata.get("namespace")
+        name = metadata.get("name")
+        uid = metadata.get("uid")
+        if not namespace or not name or not uid:
+            return None
+        if int((workload.get("status") or {}).get("allocated") or 0) > 0:
+            return None
+        try:
+            events = self.k8s_client.list_events(
+                namespace=namespace,
+                field_selector=f"involvedObject.uid={uid},reason=FailedCreate",
+            )
+            # The error alone, before the appended pod spec: that JSON carries the
+            # caller's own environment and commands, and must not be able to say
+            # "exceeded quota" on the API server's behalf.
+            errors = (str(getattr(e, "message", "") or "").split(", pod: ", 1)[0] for e in events or [])
+            refusal = next((m for m in errors if QUOTA_EXCEEDED_MESSAGE_MARKER in m.lower()), None)
+            if refusal is None:
+                return None
+            # One pod per BatchSandbox here, named <name>-<index> by the controller.
+            if self.k8s_client.read_pod(namespace=namespace, name=f"{name}-0") is not None:
+                return None
+        except Exception:
+            # Best effort: the wait falls back to its readiness budget. Said once per
+            # BatchSandbox, not on every poll, so a missing grant (Events, Pods) is
+            # visible in the log rather than only as a slower refusal.
+            if uid not in self._refusal_lookup_warned:
+                if len(self._refusal_lookup_warned) > 1024:
+                    self._refusal_lookup_warned.clear()
+                self._refusal_lookup_warned.add(uid)
+                logger.warning(
+                    "could not check BatchSandbox %s/%s for a refused pod; "
+                    "a quota refusal will surface as a readiness timeout",
+                    namespace, name, exc_info=True,
+                )
+            return None
+        return refusal
+
     def get_internal_endpoint(
         self, workload: Dict[str, Any], port: int, sandbox_id: str
     ) -> Optional[Endpoint]:

@@ -273,6 +273,15 @@ class WorkloadProvider(ABC):
             body=body,
         )
 
+    def pod_admission_refusal(self, workload: Any) -> Optional[str]:
+        """The API server's quota refusal of this workload's pod, when only an Event says so.
+
+        For providers whose controller reports a refused pod nowhere ``get_status`` can see.
+        Called from the readiness wait off the event loop, and only while the workload is
+        pending; a message means the wait can stop with a quota error now. Default: none.
+        """
+        return None
+
     def supports_image_auth(self) -> bool:
         """
         Whether this provider supports per-request image pull authentication.

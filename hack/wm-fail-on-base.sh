@@ -569,6 +569,7 @@ copy server/tests/test_wm19_proxy_revalidation.py
 # WM-23: execd's token, written with upstream symbols only (string literals for the new
 # constants). The helper unit tests in test_execd_access_token.py are not WM tests.
 copy server/tests/k8s/test_wm23_execd_token_behaviour.py
+copy server/tests/k8s/test_wm24_quota_refusal_behaviour.py
 # WM-21: the credential proxy addon's own tests, run against upstream's system.py.
 copy components/egress/tests/test_mitmscripts_system.py
 

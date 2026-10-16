@@ -413,6 +413,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         last_message = None
         pool_capacity_started_at: float | None = None
         pool_capacity_blocked_seconds = 0.0
+        # When pod_admission_refusal was last asked; -inf so the first pending poll asks.
+        last_refusal_check = float("-inf")
         if pool_acquisition_timeout_seconds is None:
             pool_acquisition_timeout_seconds = float(timeout_seconds)
         effective_pool_acquisition_timeout_seconds = min(
@@ -558,6 +560,20 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                         raise _build_quota_exceeded_error(
                             current_message or current_reason or "no quota details"
                         )
+                    # The same rejection, from a provider whose controller only emits an
+                    # Event for it (BatchSandbox). Read off the event loop, at most every
+                    # couple of seconds, and only while nothing has been allocated.
+                    if (
+                        current_state == "Pending"
+                        and current_reason == "BATCHSANDBOX_PENDING"
+                        and time.monotonic() - last_refusal_check >= 2.0
+                    ):
+                        last_refusal_check = time.monotonic()
+                        refusal = await asyncio.to_thread(
+                            self.workload_provider.pod_admission_refusal, workload
+                        )
+                        if isinstance(refusal, str) and refusal:
+                            raise _build_quota_exceeded_error(refusal)
 
                     now = time.monotonic()
                     pool_capacity_exhausted = _is_pool_capacity_exhausted_status(

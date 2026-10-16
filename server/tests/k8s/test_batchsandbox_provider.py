@@ -1357,6 +1357,73 @@ spec:
         assert result["state"] == "Pending"
         assert result["reason"] == "BATCHSANDBOX_PENDING"
 
+    _QUOTA_EVENT = (
+        'failed to create pod: pods "sbx-0" is forbidden: exceeded quota: sandbox-quota, '
+        "requested: limits.memory=2688Mi, used: limits.memory=32256Mi, limited: limits.memory=34Gi, "
+        'pod: {"metadata":{"name":"sbx-0"},"spec":{"containers":[]}}'
+    )
+
+    def _unallocated(self):
+        return {
+            "status": {"replicas": 1, "ready": 0, "allocated": 0},
+            "metadata": {"namespace": "sbx-ns", "name": "sbx", "uid": "uid-1", "creationTimestamp": "2025-12-24T10:00:00Z"},
+        }
+
+    def _client(self, messages, pod=None):
+        client = MagicMock()
+        client.list_events.return_value = [SimpleNamespace(message=m) for m in messages]
+        client.read_pod.return_value = pod
+        return client
+
+    def test_pod_admission_refusal_ignores_a_stale_event_once_the_pod_exists(self):
+        """A retry after quota freed up created the pod; the old Event is history, status lagging or not."""
+        provider = BatchSandboxProvider(self._client([self._QUOTA_EVENT], pod=SimpleNamespace()))
+
+        assert provider.pod_admission_refusal(self._unallocated()) is None
+
+    def test_pod_admission_refusal_ignores_other_failed_creates(self):
+        client = self._client(['failed to create pod: Internal error occurred: failed calling webhook, pod: {}'])
+        provider = BatchSandboxProvider(client)
+
+        assert provider.pod_admission_refusal(self._unallocated()) is None
+        client.read_pod.assert_not_called()
+
+    def test_pod_admission_refusal_ignores_the_marker_inside_the_appended_pod_spec(self):
+        """The pod JSON carries the caller's env; it must not turn a webhook error into a quota refusal."""
+        client = self._client([
+            'failed to create pod: Internal error occurred: failed calling webhook, '
+            'pod: {"spec":{"containers":[{"env":[{"name":"X","value":"exceeded quota"}]}]}}'
+        ])
+        provider = BatchSandboxProvider(client)
+
+        assert provider.pod_admission_refusal(self._unallocated()) is None
+
+    def test_pod_admission_refusal_is_none_when_events_cannot_be_read(self):
+        client = MagicMock()
+        client.list_events.side_effect = RuntimeError("forbidden")
+        provider = BatchSandboxProvider(client)
+
+        assert provider.pod_admission_refusal(self._unallocated()) is None
+
+    def test_pod_admission_refusal_is_not_asked_once_a_pod_is_allocated(self):
+        client = self._client([self._QUOTA_EVENT])
+        provider = BatchSandboxProvider(client)
+        workload = self._unallocated()
+        workload["status"]["allocated"] = 1
+
+        assert provider.pod_admission_refusal(workload) is None
+        client.list_events.assert_not_called()
+
+    def test_get_status_makes_no_event_call(self):
+        """get_status serves every reader (lists, gets); the Event lookup is the readiness wait's alone."""
+        client = self._client([self._QUOTA_EVENT])
+        provider = BatchSandboxProvider(client)
+
+        result = provider.get_status(self._unallocated())
+
+        assert result["reason"] == "BATCHSANDBOX_PENDING"
+        client.list_events.assert_not_called()
+
     def test_get_status_reports_pool_capacity_condition(self):
         provider = BatchSandboxProvider(MagicMock())
         workload = {
