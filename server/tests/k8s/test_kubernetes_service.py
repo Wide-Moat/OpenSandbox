@@ -1328,6 +1328,34 @@ class TestWaitForSandboxReady:
         assert "exceeded quota" in exc_info.value.detail["message"]
 
     @pytest.mark.asyncio
+    async def test_wait_keeps_polling_when_batchsandbox_has_no_refusal(self, k8s_service, mock_workload):
+        status_sequence = [
+            {
+                "state": "Pending",
+                "reason": "BATCHSANDBOX_PENDING",
+                "message": "BatchSandbox is pending allocation",
+                "last_transition_at": datetime.now(timezone.utc),
+            },
+            {
+                "state": "Running",
+                "reason": "",
+                "message": "Running",
+                "last_transition_at": datetime.now(timezone.utc),
+            },
+        ]
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.side_effect = status_sequence
+        k8s_service.workload_provider.pod_admission_refusal.return_value = None
+
+        result = await k8s_service._wait_for_sandbox_ready(
+            "test-sandbox-id",
+            timeout_seconds=10,
+            poll_interval_seconds=0.1,
+        )
+
+        assert result == mock_workload
+
+    @pytest.mark.asyncio
     async def test_wait_keeps_polling_for_non_quota_reconciler_error(self, k8s_service, mock_workload):
         """ReconcilerError without quota text (transient controller error) must keep polling."""
         status_sequence = [

@@ -557,6 +557,16 @@ class K8sClient:
         )
         return resp.items
 
+    def list_events(self, namespace: str, field_selector: str) -> List[Any]:
+        """List core/v1 Events in a namespace matching a field selector."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        resp = self.get_core_v1_api().list_namespaced_event(
+            namespace=namespace,
+            field_selector=field_selector,
+        )
+        return resp.items
+
     def read_pod(self, namespace: str, name: str) -> Any | None:
         """Read a Pod by name, returning None when it no longer exists."""
         if self._read_limiter:
