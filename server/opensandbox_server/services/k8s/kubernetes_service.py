@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
+import httpx
 from fastapi import HTTPException, status
 from kubernetes.client import ApiException
 
@@ -51,6 +52,8 @@ from opensandbox_server.api.schema import (
 )
 from opensandbox_server.config import AppConfig, INGRESS_MODE_GATEWAY, SecureAccessConfig, get_config
 from opensandbox_server.services.constants import (
+    SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
+    SANDBOX_EXECD_ACCESS_TOKEN_METADATA_KEY,
     SANDBOX_ID_LABEL,
     SANDBOX_MANAGED_VOLUMES_LABEL,
     SANDBOX_OWNER_SUBJECT_ANNOTATION,
@@ -65,6 +68,7 @@ from opensandbox_server.services.endpoint_auth import (
 from opensandbox_server.services.extension_service import ExtensionService
 from opensandbox_server.services.helpers import format_ingress_endpoint
 from opensandbox_server.services.k8s.create_helpers import _build_create_workload_context
+from opensandbox_server.services.k8s import warm_pool
 from opensandbox_server.services.k8s.error_helpers import (
     _build_k8s_api_error,
     _build_quota_exceeded_error,
@@ -209,6 +213,29 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             f"KubernetesSandboxService initialized: "
             f"namespace={self.namespace}, execd_image={self.execd_image}"
         )
+        self._warm_pool: Optional[warm_pool.WarmPoolReconciler] = None
+        self._warm_revision_value: Optional[str] = None
+        if self.app_config.warm_pool.enabled:
+            self._warm_pool = warm_pool.WarmPoolReconciler(
+                lambda: self.workload_provider, self.k8s_client, self.app_config, self.execd_image
+            )
+
+    def _warm_revision(self) -> str:
+        if self._warm_revision_value is None:
+            self._warm_revision_value = warm_pool.template_revision(
+                self.app_config, self.workload_provider, self.execd_image
+            )
+        return self._warm_revision_value
+
+    def close(self) -> None:
+        if self._warm_pool is not None:
+            self._warm_pool.stop()
+        super().close()
+
+    def start_warm_pool(self) -> None:
+        """Begin keeping the warm pool (WM-29). Called once the app is serving."""
+        if self._warm_pool is not None:
+            self._warm_pool.start()
 
     def set_tenant_provider(self, provider: object) -> None:
         self._tenant_provider = provider  # type: ignore[assignment]
@@ -832,6 +859,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         # storage yanked when the owner's cleanup or ownerReference GC fires.
         # We cache the get_pvc result so the create loop below doesn't refetch.
         existing_cache: dict[str, Any] = {}
+        resolved_aliases: set[str] = set()
         for vol in volumes:
             if vol.pvc is None:
                 continue
@@ -864,6 +892,30 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                         },
                     ) from e
                 raise
+            # WM-29: a home a warm pod was claimed with answers to the name its owner's client
+            # asked for through that name's anchor, not through its own name. The anchor wins
+            # even over a claim that has the name itself: one can only exist beside a committed
+            # anchor if a cold create raced the warm claim, and the warm home is the one the
+            # name was reserved for. Also with the pool switched off, as long as
+            # resolve_claimed_homes stays on.
+            aliased = (
+                self._resolve_home_alias(claim_name)
+                if self.app_config.warm_pool.resolve_claimed_homes
+                else None
+            )
+            if aliased is not None:
+                claim_name = aliased.metadata.name
+                vol.pvc.claim_name = claim_name
+                existing = aliased
+                resolved_aliases.add(claim_name)
+            if (
+                existing is not None
+                and ((getattr(existing.metadata, "labels", None) or {}).get(warm_pool.WARM_POOL_HOME_LABEL))
+                and claim_name not in resolved_aliases
+            ):
+                # A warm pod's home is never mounted by naming it: unclaimed it belongs to
+                # nobody yet, claimed it is reached only through its alias.
+                raise HTTPException(status_code=404, detail="Volume not found")
             if subject is not None and existing is None and not vol.pvc.create_if_not_exists:
                 raise HTTPException(status_code=404, detail="Volume not found")
             existing_cache[claim_name] = existing
@@ -997,6 +1049,25 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     ) from e
         return managed_pvcs
 
+    def _resolve_home_alias(self, claim_name: str) -> Any:
+        """The claimed warm home that answers to ``claim_name``, or None (WM-29), read from the
+        name's anchor -- the one object a home name can have. A home still being claimed is not
+        handed out: if that claim fails its home is deleted, and a sandbox mounting it then
+        would lose its home underneath it."""
+        namespace = self._resolve_namespace()
+        home, state = warm_pool.resolve_anchor(self.k8s_client, namespace, claim_name)
+        if home is None or state == "stale":
+            return None
+        if state != "committed":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": SandboxErrorCodes.K8S_API_ERROR,
+                    "message": "This home is being prepared by another create; retry shortly.",
+                },
+            )
+        return self.k8s_client.get_pvc(namespace, home)
+
     def _reject_pvc_owned_by_other_sandbox(
         self,
         pvc: Any,
@@ -1089,6 +1160,248 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     f"controller-driven (TTL) cleanup may not."
                 )
 
+    async def _claim_warm(
+        self, request: CreateSandboxRequest, subject: Optional[str]
+    ) -> Optional[CreateSandboxResponse]:
+        """Serve this create from the warm pool, or answer None and let it go cold (WM-29).
+
+        None is every outcome but success: a create that does not match the pool, a home
+        that already exists (a resumed chat mounts its own home, which only a cold pod can),
+        an empty pool, or a claim that fails half-way -- whose pod is then deleted, never
+        returned, and whose home is deleted with it.
+        """
+        cfg = self.app_config.warm_pool
+        namespace = self._resolve_namespace()
+        if cfg.namespace and namespace != cfg.namespace:
+            return None
+        reason = warm_pool.incompatibility(request, cfg)
+        if reason is not None:
+            logger.info(f"warm pool {cfg.name}: cold create, {reason}")
+            return None
+        claim_name = request.volumes[0].pvc.claim_name
+        if await asyncio.to_thread(self.k8s_client.get_pvc, namespace, claim_name) is not None:
+            return None
+        home_of, _state = await asyncio.to_thread(warm_pool.resolve_anchor, self.k8s_client, namespace, claim_name)
+        if home_of is not None:
+            return None
+        try:
+            key = await asyncio.to_thread(warm_pool.egress_key, self.k8s_client, namespace, cfg)
+        except warm_pool.ClaimFailed as exc:
+            logger.warning(f"warm pool {cfg.name}: cold create, {exc}")
+            return None
+
+        began = time.monotonic()
+        deadline = began + cfg.claim_timeout_seconds
+        timeline: Dict[str, float] = {}
+
+        def mark(step: str) -> None:
+            timeline[step] = round((time.monotonic() - began) * 1000.0, 1)
+
+        sandbox_id = self.generate_sandbox_id()
+        created_at = datetime.now(timezone.utc)
+        context = _build_create_workload_context(
+            app_config=self.app_config,
+            request=request,
+            sandbox_id=sandbox_id,
+            created_at=created_at,
+            egress_token_factory=lambda: "",
+            secure_access_token_factory=generate_secure_access_token,
+            execd_access_token_factory=generate_execd_access_token,
+        )
+        tenant = get_current_tenant()
+        if tenant is not None:
+            context.labels[SANDBOX_TENANT_LABEL] = tenant.name
+        apply_access_renew_extend_seconds_to_mapping(context.annotations, request.extensions)
+        apply_extensions_to_mapping(context.annotations, request.extensions)
+        if subject is not None:
+            context.annotations[SANDBOX_OWNER_SUBJECT_ANNOTATION] = subject
+        context.annotations.pop(SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY, None)
+        context.annotations[warm_pool.WARM_CLAIMED_ANNOTATION] = "true"
+        execd_token = context.annotations[SANDBOX_EXECD_ACCESS_TOKEN_METADATA_KEY]
+        provider = self.workload_provider
+        # The claim is a BatchSandbox: warm_pool requires that provider (config validation).
+        group, version, plural = "sandbox.opensandbox.io", "v1alpha1", "batchsandboxes"
+
+        home_taken: Optional[str] = None
+        pod_name = ""
+        creating = asyncio.ensure_future(asyncio.to_thread(
+            provider.create_warm_claim,
+            batchsandbox_name=sandbox_id,
+            namespace=namespace,
+            labels=context.labels,
+            annotations=context.annotations,
+            pool_ref=cfg.name,
+            expires_at=context.expires_at,
+        ))
+        try:
+            await asyncio.shield(creating)
+        except BaseException as exc:  # noqa: BLE001 - the cold path is the answer
+            if not creating.done():
+                # Cancelled while the create runs on in its thread: let it land first, or the
+                # delete below finds nothing and the claim it then makes holds a pod for good.
+                await asyncio.gather(creating, return_exceptions=True)
+            # An error does not prove the object was not made: the API server can persist it
+            # and lose the answer -- and a cancelled request leaves the create running in its
+            # thread. Deleted by name either way (404 is the expected answer).
+            logger.warning(f"warm pool {cfg.name}: cold create, the claim could not be made: {exc!r}")
+            try:
+                await asyncio.shield(asyncio.to_thread(
+                    self.k8s_client.delete_custom_object,
+                    group=group, version=version, namespace=namespace, plural=plural,
+                    name=sandbox_id, grace_period_seconds=0,
+                ))
+            except Exception as cleanup:  # noqa: BLE001
+                if getattr(cleanup, "status", None) != 404:
+                    logger.error(f"warm pool: could not delete failed claim {sandbox_id}: {cleanup}")
+            if not isinstance(exc, Exception):
+                raise
+            return None
+        mark("created")
+        try:
+            pod_name, pod_ip = await warm_pool.wait_for_allocation(
+                self.k8s_client, namespace, sandbox_id, deadline, group, version, plural
+            )
+            mark("allocated")
+            pod = await asyncio.to_thread(self.k8s_client.read_pod, namespace, pod_name)
+            labels = (pod.metadata.labels or {}) if pod is not None else {}
+            if labels.get(warm_pool.WARM_POOL_POD_LABEL) != cfg.name:
+                raise warm_pool.ClaimFailed(f"pod {pod_name} is not a pod of this pool")
+            if labels.get(warm_pool.WARM_TEMPLATE_LABEL) != self._warm_revision():
+                # Made from an older rendering: claiming it would give this create a pod it
+                # did not ask for. It is deleted with the claim, which also rolls it out.
+                raise warm_pool.ClaimFailed(f"pod {pod_name} predates the current pool template")
+            pod_uid = pod.metadata.uid
+            home = warm_pool.home_claim_name(pod, cfg)
+            egress_token = warm_pool.derive_egress_token(key, pod_uid)
+            seed = request.credential_proxy.seed.model_dump(mode="json") if request.credential_proxy.seed else None
+            policy = request.network_policy.model_dump(by_alias=True, exclude_none=True)
+            claimed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+            def remaining() -> float:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise warm_pool.ClaimFailed("the claim ran out of its budget")
+                return left
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(remaining()), trust_env=False) as client:
+                # Three independent writes at once -- and every one of them settled before
+                # anything is judged: a failure must not be cleaned up while a sibling write
+                # is still landing behind it.
+                writes = asyncio.gather(
+                    asyncio.to_thread(
+                        self.k8s_client.patch_custom_object,
+                        group, version, namespace, plural, sandbox_id,
+                        {"metadata": {"annotations": {SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY: egress_token}}},
+                    ),
+                    asyncio.to_thread(
+                        warm_pool.take_home,
+                        self.k8s_client, namespace, home, pod_uid, claim_name, subject, sandbox_id,
+                        SANDBOX_OWNER_SUBJECT_ANNOTATION, claimed_at,
+                    ),
+                    # wait_for: httpx's timeout bounds each network phase, not a request, and
+                    # this makes two requests -- the budget is a deadline, so it is enforced as one.
+                    asyncio.wait_for(warm_pool.push_to_sidecar(client, pod_ip, egress_token, policy, seed), remaining()),
+                    return_exceptions=True,
+                )
+                try:
+                    results = await asyncio.shield(writes)
+                except asyncio.CancelledError:
+                    # Cancelling the wait does not stop the writes in their threads: let them
+                    # land, so the cleanup below sees what they did, then go on being cancelled.
+                    settled = await asyncio.gather(writes, return_exceptions=True)
+                    if settled and not isinstance(settled[0], BaseException) and not isinstance(settled[0][1], BaseException):
+                        home_taken = home
+                    raise
+                if not isinstance(results[1], BaseException):
+                    home_taken = home
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                mark("pushed")
+                remaining()
+                await asyncio.wait_for(warm_pool.bind_execd(
+                    client, pod_ip, sandbox_id, execd_token,
+                    warm_pool.init_envs(context.sandbox_env), cfg,
+                ), remaining())
+                remaining()
+                committing = asyncio.ensure_future(asyncio.to_thread(
+                    warm_pool.commit_home, self.k8s_client, namespace, claim_name, sandbox_id
+                ))
+                try:
+                    await asyncio.shield(committing)
+                except asyncio.CancelledError:
+                    # Let the commit land before the cleanup releases the name it commits.
+                    await asyncio.gather(committing, return_exceptions=True)
+                    raise
+                mark("bound")
+        except BaseException as exc:  # noqa: BLE001 - every failure goes cold, and leaves nothing
+            # BaseException: a cancelled request (shutdown, a caller's timeout) holds a pod
+            # and maybe a home just like a failed one, and nobody would ever learn their ids.
+            if "sidecar refused" in str(exc):
+                # Perhaps a rotated key: read it again for the next claim.
+                warm_pool.forget_egress_key(namespace, cfg)
+            logger.warning(
+                f"warm pool {cfg.name}: claim of {pod_name or 'no pod'} for sandbox {sandbox_id} "
+                f"failed after {timeline}: {str(exc) or type(exc).__name__}; deleting it and creating cold"
+            )
+            try:
+                # By name, not through the provider's lookup: a claim made a moment ago may
+                # not be in the informer yet, and a claim left behind holds a pod for good.
+                await asyncio.to_thread(
+                    self.k8s_client.delete_custom_object,
+                    group=group, version=version, namespace=namespace, plural=plural,
+                    name=sandbox_id, grace_period_seconds=0,
+                )
+            except Exception as cleanup:  # noqa: BLE001
+                logger.error(f"warm pool: could not delete failed claim {sandbox_id}: {cleanup}")
+            if home_taken is None and pod_name:
+                # The patch may have landed even though another step failed; the label says.
+                try:
+                    pvc = await asyncio.to_thread(
+                        self.k8s_client.get_pvc, namespace, f"{pod_name}-{cfg.home_volume_name}"
+                    )
+                    labels = (getattr(pvc, "metadata", None) and pvc.metadata.labels) or {}
+                    if labels.get(warm_pool.HOME_ALIAS_LABEL):
+                        home_taken = pvc.metadata.name
+                except Exception:  # noqa: BLE001
+                    pass
+            if pod_name:
+                try:
+                    await asyncio.to_thread(
+                        warm_pool.release_home_name, self.k8s_client, namespace, claim_name,
+                        f"{pod_name}-{cfg.home_volume_name}",
+                    )
+                except Exception as cleanup:  # noqa: BLE001
+                    logger.error(f"warm pool: could not release the home name of a failed claim: {cleanup}")
+            if home_taken is not None:
+                try:
+                    await asyncio.to_thread(self.k8s_client.delete_pvc, namespace, home_taken)
+                except Exception as cleanup:  # noqa: BLE001
+                    logger.error(f"warm pool: could not delete the home {home_taken} of a failed claim: {cleanup}")
+            if not isinstance(exc, Exception):
+                raise
+            return None
+
+        logger.info(
+            f"warm pool {cfg.name}: sandbox {sandbox_id} claimed pod {pod_name} "
+            f"home={home_taken} timeline_ms={timeline}"
+        )
+        return CreateSandboxResponse(
+            id=sandbox_id,
+            status=SandboxStatus(
+                state="Running",
+                reason="WARM_POOL_CLAIMED",
+                message=f"Claimed a warm pod in {timeline.get('bound', 0):.0f} ms",
+                last_transition_at=created_at,
+            ),
+            created_at=created_at,
+            expires_at=context.expires_at,
+            metadata=request.metadata,
+            extensions=extract_extensions_from_mapping(context.annotations),
+            entrypoint=request.entrypoint,
+            platform=request.platform,
+        )
+
     async def create_sandbox(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
         """
         Create a new sandbox using Kubernetes Pod.
@@ -1123,6 +1436,16 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         self._ensure_secure_access_support(request)
         self._ensure_network_policy_support(request)
         self._ensure_image_auth_support(request)
+
+        if request.extensions and warm_pool.WARM_CLAIMED_EXTENSION in request.extensions:
+            # The server says whether a sandbox came from the pool; a caller cannot.
+            extensions = dict(request.extensions)
+            extensions.pop(warm_pool.WARM_CLAIMED_EXTENSION, None)
+            request = request.model_copy(update={"extensions": extensions})
+        if not has_pool_ref and warm_pool.wants_pool(request, self.app_config.warm_pool):
+            claimed = await self._claim_warm(request, subject)
+            if claimed is not None:
+                return claimed
 
         sandbox_id = self.generate_sandbox_id()
 
