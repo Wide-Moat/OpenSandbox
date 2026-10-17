@@ -434,6 +434,28 @@ class WarmPoolReconciler:
 # ------------------------------------------------------------------------ the claim
 
 
+FREE_PODS_READ_TIMEOUT_SECONDS = 1.0
+
+
+def free_pods(k8s_client: Any, namespace: str, cfg: WarmPoolConfig) -> Optional[int]:
+    """The Pool's own count of ready, unallocated pods (status.available), or None when it
+    cannot be read or carries no such count -- None means "ask the pool anyway" (WM-33)."""
+    try:
+        # Bounded: this read sits before the claim's own budget starts, and a stalled API
+        # server must not hold a create that could go cold.
+        obj = k8s_client.get_custom_objects_api().get_namespaced_custom_object(
+            OPENSANDBOX_API_GROUP, OPENSANDBOX_API_VERSION, namespace, POOL_PLURAL, cfg.name,
+            _request_timeout=FREE_PODS_READ_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable Pool only means asking it as before
+        logger.debug("warm pool %s: could not read the Pool's status: %s", cfg.name, exc)
+        return None
+    value = ((obj or {}).get("status") or {}).get("available") if isinstance(obj, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 class ClaimFailed(Exception):
     """A claim that could not complete; the create goes cold."""
 

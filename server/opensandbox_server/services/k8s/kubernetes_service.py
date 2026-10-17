@@ -26,7 +26,7 @@ import logging
 import math
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 from fastapi import HTTPException, status
@@ -216,6 +216,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         )
         self._warm_pool: Optional[warm_pool.WarmPoolReconciler] = None
         self._warm_revision_value: Optional[str] = None
+        # WM-33: warm claims this server has started and that hold no pod yet, and how many
+        # have been handed one since the server started.
+        self._warm_claims_in_flight = 0
+        self._warm_allocations = 0
         if self.app_config.warm_pool.enabled:
             self._warm_pool = warm_pool.WarmPoolReconciler(
                 lambda: self.workload_provider, self.k8s_client, self.app_config, self.execd_image
@@ -1247,6 +1251,71 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             logger.warning(f"warm pool {cfg.name}: cold create, {exc}")
             return None
 
+        # WM-33: a claim the pool cannot serve is not free. It waits the whole budget
+        # (claim_timeout_seconds) for a pod that is not coming -- a refill takes seconds,
+        # measured 6-8 s on stage -- and the pool controller starts extra pods for it, which
+        # it deletes again once the claim is withdrawn. In a burst beyond the pool's size every
+        # create after the first few paid that wait before even starting cold. So the Pool's
+        # own count of ready, unallocated pods is read first, less this server's claims not
+        # yet allocated (an allocated pod has already left that count); when nothing is left
+        # the create goes cold at once. An unreadable Pool (None) asks the pool as before.
+        # Another replica's claims are not counted: at worst they wait the budget, which is
+        # where every claim was before.
+        # A claim allocated while the read was in flight may or may not be in the count it
+        # returns, so such a read is taken again once; if a second one overlaps an allocation
+        # too, those are subtracted as if the count still held them.
+        # Each read is bounded here as well as in the client: retries inside the client and a
+        # busy thread pool are outside its request timeout. A read that runs out is unreadable.
+        for _attempt in range(2):
+            allocations_before = self._warm_allocations
+            try:
+                free = await asyncio.wait_for(
+                    asyncio.to_thread(warm_pool.free_pods, self.k8s_client, namespace, cfg),
+                    warm_pool.FREE_PODS_READ_TIMEOUT_SECONDS + 0.5,
+                )
+            except asyncio.TimeoutError:
+                free = None
+                break
+            if self._warm_allocations == allocations_before:
+                break
+        taken = self._warm_claims_in_flight + (self._warm_allocations - allocations_before)
+        if free is not None and free <= taken:
+            logger.info(
+                f"warm pool {cfg.name}: cold create, no free pod "
+                f"(available={free}, claims in flight={taken})"
+            )
+            return None
+        self._warm_claims_in_flight += 1
+        reservation = {"held": True}
+
+        def release() -> None:
+            if reservation["held"]:
+                reservation["held"] = False
+                self._warm_claims_in_flight -= 1
+
+        def allocated() -> None:
+            if reservation["held"]:
+                release()
+                self._warm_allocations += 1
+
+        try:
+            return await self._claim_warm_pod(request, subject, cfg, namespace, claim_name, key, allocated)
+        finally:
+            # A claim that ends without a pod (failed, cancelled, out of budget) took none.
+            release()
+
+    async def _claim_warm_pod(
+        self,
+        request: CreateSandboxRequest,
+        subject: Optional[str],
+        cfg: Any,
+        namespace: str,
+        claim_name: str,
+        key: str,
+        allocated: Callable[[], None] = lambda: None,
+    ) -> Optional[CreateSandboxResponse]:
+        """The claim itself, once _claim_warm has decided the pool is worth asking (WM-29).
+        ``allocated`` is called once a pod is handed to the claim (WM-33)."""
         began = time.monotonic()
         deadline = began + cfg.claim_timeout_seconds
         timeline: Dict[str, float] = {}
@@ -1319,6 +1388,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 self.k8s_client, namespace, sandbox_id, deadline, group, version, plural
             )
             mark("allocated")
+            allocated()
             pod = await asyncio.to_thread(self.k8s_client.read_pod, namespace, pod_name)
             labels = (pod.metadata.labels or {}) if pod is not None else {}
             if labels.get(warm_pool.WARM_POOL_POD_LABEL) != cfg.name:

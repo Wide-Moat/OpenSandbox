@@ -607,3 +607,214 @@ def _not_found(*_args, **_kwargs):
     error = Exception("not found")
     error.status = 404
     raise error
+
+
+def _pool_reports(env, available):
+    """The Pool object answers with status.available; every other custom object as before."""
+    claims = env.custom.get_namespaced_custom_object.side_effect
+    pool_reads = []
+
+    def get(group, version, namespace, plural, name, **kwargs):
+        if plural == "pools":
+            pool_reads.append((name, kwargs.get("_request_timeout")))
+            now = available() if callable(available) else available
+            if isinstance(now, Exception):
+                raise now
+            return {"metadata": {"name": name}, "status": {"available": now, "total": 3}}
+        return claims(group, version, namespace, plural, name)
+
+    env.custom.get_namespaced_custom_object.side_effect = get
+    return pool_reads
+
+
+@pytest.mark.asyncio
+async def test_wm33_a_pool_with_no_free_pod_is_not_asked():
+    """The pool would even hand out a pod here (allocate=True) -- the claim must not be made
+    because the Pool says none is free. Before WM-33 the claim was made and waited its budget."""
+    env = _Env()
+    service = _service(_config(claim_timeout_seconds=2), env)
+    reads = _pool_reports(env, 0)
+
+    began = asyncio.get_running_loop().time()
+    await _create(service, env, _request())
+    took = asyncio.get_running_loop().time() - began
+
+    assert [name for name, _timeout in reads] == [POOL], "the Pool's status was not read"
+    assert reads[0][1], "the Pool read carries no request timeout: a stalled API server would hold the create"
+    assert not [b for b in env.created if b["spec"].get("poolRef")], "a claim was made on an empty pool"
+    assert len([b for b in env.created if not b["spec"].get("poolRef")]) == 1, "the create did not go cold"
+    assert took < 1.0, f"the cold create still waited ({took:.2f} s)"
+
+
+@pytest.mark.asyncio
+async def test_wm33_creates_beyond_the_free_pods_go_cold_at_once():
+    """One free pod, two creates at once: one claim, one cold create -- not two claims of
+    which one waits the budget. The first claim is held in flight by a slow execd bind."""
+    env = _Env(execd_delay=0.3)
+    service = _service(_config(claim_timeout_seconds=2), env)
+    _pool_reports(env, 1)
+
+    # One patch around both: two overlapping patch() contexts restore out of order and leave
+    # httpx.AsyncClient patched for every later test.
+    with patch("httpx.AsyncClient", side_effect=env.client_factory):
+        first, second = await asyncio.gather(
+            service.create_sandbox(_request(home="osb-home-a")),
+            service.create_sandbox(_request(home="osb-home-b")),
+        )
+
+    claims = [b for b in env.created if b["spec"].get("poolRef")]
+    cold = [b for b in env.created if not b["spec"].get("poolRef")]
+    assert len(claims) == 1, f"{len(claims)} claims for one free pod"
+    assert len(cold) == 1
+    warm = [r for r in (first, second) if (r.extensions or {}).get("opensandbox.extensions.warm-claimed") == "true"]
+    assert len(warm) == 1
+    assert service._warm_claims_in_flight == 0, "a finished claim is still counted"
+
+
+@pytest.mark.asyncio
+async def test_wm33_an_unreadable_pool_is_asked_as_before():
+    """The guard: no count to go by (the Pool cannot be read) means the claim is still made."""
+    env = _Env()
+    service = _service(_config(), env)
+    _pool_reports(env, RuntimeError("forbidden"))
+
+    response = await _create(service, env, _request())
+
+    assert len([b for b in env.created if b["spec"].get("poolRef")]) == 1
+    assert response.extensions.get("opensandbox.extensions.warm-claimed") == "true"
+
+
+@pytest.mark.asyncio
+async def test_wm33_an_allocated_claim_is_not_counted_twice():
+    """Two free pods. The first claim is allocated (the Pool now says 1) and is still binding
+    execd when the second create arrives: the second must still be claimed. Counting every
+    unfinished claim would subtract the first pod twice and send the second create cold."""
+    env = _Env(execd_delay=0.5)
+    service = _service(_config(claim_timeout_seconds=3), env)
+    allocated = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    claims = env.custom.get_namespaced_custom_object.side_effect
+
+    def claim_read(group, version, namespace, plural, name, **kwargs):
+        answer = claims(group, version, namespace, plural, name)
+        if plural != "pools" and answer.get("status", {}).get("allocated"):
+            loop.call_soon_threadsafe(allocated.set)
+        return answer
+
+    env.custom.get_namespaced_custom_object.side_effect = claim_read
+    _pool_reports(env, lambda: 1 if allocated.is_set() else 2)
+
+    with patch("httpx.AsyncClient", side_effect=env.client_factory):
+        first = asyncio.ensure_future(service.create_sandbox(_request(home="osb-home-a")))
+        await asyncio.wait_for(allocated.wait(), 2)
+        await asyncio.sleep(0.05)
+        assert not first.done(), "the first claim was not held in flight"
+        second = asyncio.ensure_future(service.create_sandbox(_request(home="osb-home-b")))
+        responses = await asyncio.gather(first, second)
+
+    claims_made = [b for b in env.created if b["spec"].get("poolRef")]
+    assert len(claims_made) == 2, "the second create went cold although the Pool had a free pod"
+    # This env hands every claim the same pod; what is asserted is that both creates were
+    # served from the pool, not two distinct pods.
+    assert all((r.extensions or {}).get("opensandbox.extensions.warm-claimed") == "true" for r in responses)
+    assert service._warm_claims_in_flight == 0
+
+
+
+
+async def _second_read_across_an_allocation(reread_answer):
+    """Two creates, one free pod at first. The second create's first Pool read is held until
+    the first claim has been handed its pod -- the server's own allocation callback has run --
+    and then answers the count from before (1). Its retry answers ``reread_answer``."""
+    env = _Env(execd_delay=0.3)
+    service = _service(_config(claim_timeout_seconds=2), env)
+    reads = []
+
+    def get(group, version, namespace, plural, name, **kwargs):
+        if plural == "pools":
+            reads.append(name)
+            if len(reads) == 2:
+                deadline = time.monotonic() + 5
+                while service._warm_allocations == 0 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                return {"metadata": {"name": name}, "status": {"available": 1}}
+            if len(reads) >= 3:
+                return {"metadata": {"name": name}, "status": {"available": reread_answer}}
+            return {"metadata": {"name": name}, "status": {"available": 1}}
+        return claims(group, version, namespace, plural, name)
+
+    claims = env.custom.get_namespaced_custom_object.side_effect
+    env.custom.get_namespaced_custom_object.side_effect = get
+    with patch("httpx.AsyncClient", side_effect=env.client_factory):
+        responses = await asyncio.gather(
+            service.create_sandbox(_request(home="osb-home-a")),
+            service.create_sandbox(_request(home="osb-home-b")),
+        )
+    return env, service, reads, responses
+
+
+@pytest.mark.asyncio
+async def test_wm33_a_pool_count_read_across_an_allocation_is_read_again():
+    """The stale count (1) would hand the pod just allocated to a second claim. The read is
+    taken again; the fresh count (0) sends the second create cold."""
+    env, service, reads, responses = await _second_read_across_an_allocation(0)
+
+    assert len(reads) == 3, f"the Pool was read {len(reads)} times"
+    claims_made = [b for b in env.created if b["spec"].get("poolRef")]
+    assert len(claims_made) == 1, "the pod handed to the first claim was claimed again"
+    warm = [r for r in responses if (r.extensions or {}).get("opensandbox.extensions.warm-claimed") == "true"]
+    assert len(warm) == 1
+
+
+@pytest.mark.asyncio
+async def test_wm33_a_fresh_count_after_an_allocation_is_trusted():
+    """The other half: when the read taken again says a pod is still free (a pool of two,
+    one just taken), the second create claims it instead of going cold."""
+    env, service, reads, responses = await _second_read_across_an_allocation(1)
+
+    assert len(reads) == 3
+    claims_made = [b for b in env.created if b["spec"].get("poolRef")]
+    assert len(claims_made) == 2, "a free pod was passed over"
+
+
+@pytest.mark.asyncio
+async def test_wm33_a_claim_that_got_no_pod_is_not_counted_as_taking_one():
+    """The Pool says one is free but the claim is never served: it is released, not counted
+    as an allocation -- which would make every Pool read overlapping it one pod short."""
+    env = _Env(allocate=False)
+    service = _service(_config(claim_timeout_seconds=0.3), env)
+    _pool_reports(env, 1)
+
+    await _create(service, env, _request())
+
+    assert len([b for b in env.created if b["spec"].get("poolRef")]) == 1, "the pool was not asked"
+    assert service._warm_claims_in_flight == 0
+    assert service._warm_allocations == 0, "a claim that got no pod was counted as an allocation"
+
+
+@pytest.mark.asyncio
+async def test_wm33_a_pool_read_that_hangs_is_asked_as_before_not_waited_on():
+    """The Pool read hangs (an API server that accepted the connection and says nothing): the
+    create does not wait for it beyond its bound, and the pool is asked as before."""
+    env = _Env()
+    service = _service(_config(), env)
+    claims = env.custom.get_namespaced_custom_object.side_effect
+    release = threading.Event()
+
+    def get(group, version, namespace, plural, name, **kwargs):
+        if plural == "pools":
+            release.wait(10)
+            return {"metadata": {"name": name}, "status": {"available": 0}}
+        return claims(group, version, namespace, plural, name)
+
+    env.custom.get_namespaced_custom_object.side_effect = get
+    began = asyncio.get_running_loop().time()
+    try:
+        response = await _create(service, env, _request())
+    finally:
+        release.set()
+    took = asyncio.get_running_loop().time() - began
+
+    assert took < 4, f"the create waited {took:.1f} s on the Pool read"
+    assert len([b for b in env.created if b["spec"].get("poolRef")]) == 1, "the pool was not asked"
+    assert response.extensions.get("opensandbox.extensions.warm-claimed") == "true"
