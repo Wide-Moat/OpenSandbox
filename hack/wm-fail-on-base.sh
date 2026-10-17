@@ -244,6 +244,9 @@ is_guard() {
     # them all.
     test_wm15_single_tenant_refusals_still_warn_with_a_traceback_each_time) return 0 ;;
     test_wm15_other_refusals_still_warn_with_a_traceback_each_time) return 0 ;;
+    # WM-32 asks execd only once the pod has an address: a Pending BatchSandbox without one
+    # is waited on, unasked, exactly as upstream waits on it.
+    test_wm32_a_pending_batchsandbox_without_an_address_is_not_asked) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -308,6 +311,11 @@ is_unported() {
     TestWM8SeedIsRefusedWithoutTransparentMitmproxy|TestWM8SeedIsJudgedByTheEffectivePolicyIncludingAlwaysAllow|\
     TestWM8ASeedWithAnUnknownFieldIsRefusedAsTheAPIRefusesIt|TestWM8SeedIsRefusedUnderTheRevisionRuntime)
       echo "calls seedCredentialVault; upstream: TestWM8TheSeedVariableFillsTheVaultAtStartup" ;;
+    # Both point the system store at a temporary directory (systemTrustDir, added by WM-31):
+    # the guard, that sidecar enforcement still writes it as upstream does, and the external
+    # case on any host, where the portable partner skips.
+    TestWM31SidecarEnforcementStillWritesTheSystemTrustStore|TestWM31ExternalEnforcementWritesNoSystemTrustStore)
+      echo "sets systemTrustDir; upstream: TestWM31ExternalEnforcementLeavesTheSystemTrustStoreAlone" ;;
     *) return 1 ;;
   esac
 }
@@ -590,7 +598,12 @@ copy server/tests/k8s/test_wm25_seed_secret_behaviour.py
 # through create_sandbox; upstream creates cold, so nothing is claimed or pushed.
 copy server/tests/k8s/test_wm29_warm_pool_behaviour.py
 # WM-30: execd asked directly; upstream returns at the first Running/Allocated without asking.
+# WM-32 (same file): a Pending BatchSandbox with an address is asked too; upstream waits for the
+# phase to move and ends in the test's 504.
 copy server/tests/k8s/test_wm30_execd_answers_behaviour.py
+# WM-31: under external enforcement the export leaves the system store alone, with upstream
+# symbols only. Upstream adds the CA to the store first and fails there (unprivileged).
+copy components/egress/pkg/mitmproxy/system_trust_wm31_test.go
 # WM-21: the credential proxy addon's own tests, run against upstream's system.py.
 copy components/egress/tests/test_mitmscripts_system.py
 
