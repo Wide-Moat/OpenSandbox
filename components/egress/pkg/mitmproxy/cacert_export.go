@@ -110,6 +110,10 @@ func SyncRootCA(confDirEnv, home string) error {
 	return exportRootCA(confDirEnv, home, constants.OpenSandboxRootDir, true)
 }
 
+// systemTrustDir is where update-ca-certificates picks up local CAs; a variable so a
+// test can point it at a temporary directory.
+var systemTrustDir = "/usr/local/share/ca-certificates"
+
 // SyncRootCAFastSandbox exports the CA into the dedicated fast-sandbox subdir (the fastlet
 // mount point). The egress container's own system trust store is NOT touched:
 // upstream validation uses the public roots, and the CA is only meaningful to
@@ -135,6 +139,18 @@ func exportRootCA(confDirEnv, home, rootDir string, installSystemTrust bool) err
 	if !installSystemTrust {
 		return nil
 	}
+	if constants.EnforcementIsExternal() {
+		// WM-31: under external enforcement nothing in this container is intercepted --
+		// mitmdump is a regular proxy and no redirect is installed -- so the container's own
+		// trust store is on no request's path: mitmdump verifies upstream servers against
+		// the public roots the image already holds, and the sandbox reads the copy above.
+		// Adding the CA there anyway was what /healthz, and so the pod's Ready, waited for,
+		// and it is not cheap under gVisor: one run of update-ca-certificates in a live
+		// sidecar on stage took 0.78 s, 1.8 CPU-seconds and about 780 processes (2026-10-17),
+		// and with 13 pods starting at once the node had no CPU to spare for it.
+		log.Infof("[mitmproxy] egress container: system trust store left alone (external enforcement: nothing in this container is intercepted)")
+		return nil
+	}
 	if err := installMitmCAInSystemTrust(dst); err != nil {
 		return fmt.Errorf("install mitm CA into system trust store: %w", err)
 	}
@@ -145,7 +161,7 @@ func installMitmCAInSystemTrust(pemPath string) error {
 	if _, err := exec.LookPath("update-ca-certificates"); err != nil {
 		return fmt.Errorf("update-ca-certificates not found (install ca-certificates in the egress image): %w", err)
 	}
-	dir := "/usr/local/share/ca-certificates"
+	dir := systemTrustDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
