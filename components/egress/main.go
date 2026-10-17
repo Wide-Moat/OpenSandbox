@@ -51,6 +51,19 @@ func main() {
 	ctx = withLogger(ctx)
 	defer log.Logger.Sync()
 
+	// The policy API's token may be derived from a key and a subject (WM-27); refuse to
+	// start rather than run with none, then let every reader of the variable see it.
+	egressToken, derived, err := resolveEgressToken(os.Getenv)
+	if err != nil {
+		log.Fatalf("invalid policy API token configuration: %v", err)
+	}
+	if derived {
+		if err := os.Setenv(constants.EnvEgressToken, egressToken); err != nil {
+			log.Fatalf("setting the derived policy API token: %v", err)
+		}
+		log.Infof("policy API token derived from %s and %s", constants.EnvEgressTokenKey, constants.EnvEgressTokenSubject)
+	}
+
 	// Validate the chained upstream proxy env before profile dispatch: a
 	// configured proxy without transparent mitmproxy (and, outside
 	// fast-sandbox, without dns+nft enforcement) fails startup instead of

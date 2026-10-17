@@ -412,6 +412,10 @@ run_go() { # <module dir> <package> <exact test name>
 needs_netfilter() {
   case "$1" in
     TestWM8TheSeedVariableFillsTheVaultAtStartup) return 0 ;;
+    # WM-27: the three start the sidecar with external enforcement, which upstream ignores.
+    TestWM27TokenIsDerivedFromKeyAndSubject) return 0 ;;
+    TestWM27ExplicitTokenWinsOverTheKey) return 0 ;;
+    TestWM27KeyWithoutSubjectIsRefusedAtStartup) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -540,6 +544,10 @@ copy components/egress/enforcement_startup_test.go
 copy components/egress/credential_vault_seed_startup_test.go
 copy components/egress/credential_vault_api_wait_test.go
 copy components/egress/cleanup_sleep_test.go
+# WM-27: the token derived from a key and a subject, through the built binary and its policy
+# API. Upstream treats an empty token as "no authentication", so it answers a request with
+# no header 200 and fails there on what the API answers.
+copy components/egress/token_derivation_startup_test.go
 copy kubernetes/cmd/controller/watch_namespaces_flag_test.go
 copy components/execd/pkg/web/internal_init_test.go
 # WM-26: runtime-init-once, switched on through EXECD_RUNTIME_INIT_ONCE and InitFlags, so the
