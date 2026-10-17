@@ -28,12 +28,16 @@ import (
 
 	"github.com/alibaba/opensandbox/execd/pkg/binding"
 	"github.com/alibaba/opensandbox/execd/pkg/ebpf"
+	"github.com/alibaba/opensandbox/execd/pkg/flag"
 	"github.com/alibaba/opensandbox/execd/pkg/isolation"
 	"github.com/alibaba/opensandbox/execd/pkg/lifecycle"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 	"github.com/alibaba/opensandbox/execd/pkg/runtime"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
+
+// errAlreadyInitialized is what a second /internal/init gets with --runtime-init-once.
+var errAlreadyInitialized = errors.New("runtime init was already completed and execd runs with --runtime-init-once: the binding cannot be replaced")
 
 // maxInitTelemetryAttrs bounds the /internal/init telemetry attribute map.
 const maxInitTelemetryAttrs = 64
@@ -75,6 +79,10 @@ type RuntimeInitManager struct {
 
 	mu    sync.Mutex
 	ready atomic.Bool
+
+	// initConsumed is set by the first full /internal/init that completed with 200
+	// (WM-26); with flag.RuntimeInitOnce every later one is refused. Written under mu.
+	initConsumed atomic.Bool
 
 	periodic *lifecycle.PeriodicManager
 }
@@ -209,6 +217,14 @@ func (m *RuntimeInitManager) Apply(req *model.RuntimeInitRequest) ([]string, mod
 	}
 	var tokenHash [32]byte
 	hasToken := req.AccessTokenHash != ""
+	once := flag.RuntimeInitOnce
+	if once && m.initConsumed.Load() {
+		return nil, model.ErrorCodeAlreadyInitialized, http.StatusConflict, errAlreadyInitialized
+	}
+	if once && !hasToken {
+		return nil, model.ErrorCodeInvalidRequest, http.StatusBadRequest,
+			errors.New("accessTokenHash is required when execd runs with --runtime-init-once: a binding without a token would leave execd open for good")
+	}
 	if hasToken {
 		digest, err := binding.ParseAccessTokenHash(req.AccessTokenHash)
 		if err != nil {
@@ -220,9 +236,18 @@ func (m *RuntimeInitManager) Apply(req *model.RuntimeInitRequest) ([]string, mod
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Re-checked under the lock: of two concurrent inits exactly one gets here first.
+	if once && m.initConsumed.Load() {
+		return nil, model.ErrorCodeAlreadyInitialized, http.StatusConflict, errAlreadyInitialized
+	}
 	if req.PreserveRuntimeState {
 		m.applyBinding(req, tokenHash, hasToken)
 		m.MarkReady()
+		// Any successful init consumes the one allowed, this one too: it installs a token and
+		// opens the gate, so leaving it unconsumed would let a later init replace the token.
+		if once {
+			m.initConsumed.Store(true)
+		}
 		log.Info("runtime init: binding replaced with runtime state preserved sandbox_id=%s generation=%d", req.SandboxID, req.Generation)
 		return warnings, "", http.StatusOK, nil
 	}
@@ -292,6 +317,9 @@ func (m *RuntimeInitManager) Apply(req *model.RuntimeInitRequest) ([]string, mod
 	}
 
 	m.MarkReady()
+	if once {
+		m.initConsumed.Store(true)
+	}
 	return warnings, "", http.StatusOK, nil
 }
 

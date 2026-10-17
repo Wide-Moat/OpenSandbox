@@ -55,4 +55,10 @@ var (
 	// disabled, /internal/init is not served at all (WM-12): it takes no access
 	// token, and nothing outside runtime-init mode is waiting for it.
 	RuntimeInit bool
+
+	// RuntimeInitOnce (WM-26), meaningful only with RuntimeInit: the first
+	// /internal/init that completes is the only one. Every later one answers 409 and
+	// changes nothing, and one without accessTokenHash is refused. Off by default: with
+	// it off a later /internal/init stays authoritative, as upstream documents.
+	RuntimeInitOnce bool
 )
