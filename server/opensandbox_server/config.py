@@ -825,6 +825,112 @@ class StorageConfig(BaseModel):
         ),
     )
 
+
+class WarmPoolConfig(BaseModel):
+    """A pool of sandbox pods started before their holder is known (WM-29).
+
+    A pooled pod is FULLY started -- sandboxed kernel, egress sidecar with its CA, execd
+    listening, its own empty home claim mounted -- and holds nothing of anyone: execd runs
+    in runtime-init mode (it answers only /ping, /ready and one /internal/init), the sidecar
+    starts with a deny-all policy, an empty vault and a token derived from a key it cannot
+    disclose and the pod's own uid. A create that asks for this pool by name and matches it
+    is served by claiming one pod: the server pushes the policy and the vault seed to the
+    sidecar, records the person on the home claim, and binds execd to a token issued for
+    this sandbox. Anything that does not match is created cold, as before.
+
+    The template is rendered from these values by the same builder a cold create uses, so
+    the two cannot drift; the Pool object is the server's to write.
+    """
+
+    enabled: bool = Field(default=False, description="Keep a warm pool and claim from it.")
+    resolve_claimed_homes: bool = Field(
+        default=False,
+        description=(
+            "Resolve a home name to the warm home claimed under it (the home-alias label). "
+            "On whenever `enabled` is; keep it on after switching the pool off, or homes "
+            "claimed while it ran are no longer found by their name."
+        ),
+    )
+    name: str = Field(
+        default="osb-warm",
+        description=(
+            "Pool name. Pods are named <name>-<suffix>; each pod's home claim is "
+            "<pod>-<home volume name>, so a name starting with the reaper's volume prefix "
+            "puts claimed homes under the same age-based cleanup as any other."
+        ),
+    )
+    namespace: Optional[str] = Field(
+        default=None,
+        description=(
+            "Namespace the pool lives in. Required with a tenant provider, where "
+            "kubernetes.namespace is only a fallback; a claim is attempted only for a "
+            "create whose resolved namespace is this one."
+        ),
+    )
+    size: int = Field(default=3, ge=1, le=64, description="Warm pods kept ready (bufferMin = bufferMax).")
+    pool_max: int = Field(
+        default=24,
+        ge=1,
+        description=(
+            "Ceiling the controller applies to warm plus handed-out pods. A claimed pod "
+            "stays counted until its sandbox ends, so size this against concurrency; a full "
+            "pool only sends creates down the cold path."
+        ),
+    )
+    image: str = Field(default="", description="Image of the sandbox container; a create must name exactly this.")
+    entrypoint: list[str] = Field(default_factory=lambda: ["tail", "-f", "/dev/null"])
+    resource_limits: dict[str, str] = Field(default_factory=dict)
+    resource_requests: dict[str, str] = Field(default_factory=dict)
+    env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Environment of the sandbox container while warm. Nothing per person: the "
+            "create's own env is applied at the claim, to execd's processes."
+        ),
+    )
+    home_volume_name: str = Field(default="home")
+    home_mount_path: str = Field(default="/home/user")
+    home_storage: str = Field(default="10Gi")
+    home_storage_class: Optional[str] = Field(default=None)
+    egress_key_secret_name: str = Field(
+        default="opensandbox-warm-pool-egress-key",
+        description=(
+            "Secret in the pool namespace holding the key every warm sidecar derives its "
+            "token from (key `key`). The server creates it when absent and reads it back, "
+            "so it needs create, and get on this one name, on Secrets there."
+        ),
+    )
+    claim_prestart: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Command execd runs once at the claim, with the create's env, before /internal/init "
+            "returns. Empty for none. Keep it short: it is on the create's critical path."
+        ),
+    )
+    claim_prestart_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    claim_timeout_seconds: float = Field(
+        default=3.0,
+        gt=0,
+        le=30,
+        description="Time to obtain and bind a warm pod before the create goes cold instead.",
+    )
+    reconcile_interval_seconds: float = Field(default=60.0, ge=5)
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WarmPoolConfig":
+        if not self.enabled:
+            return self
+        self.resolve_claimed_homes = True
+        if not self.image:
+            raise ValueError("warm_pool.image is required when warm_pool.enabled")
+        if not self.entrypoint:
+            raise ValueError("warm_pool.entrypoint must not be empty")
+        if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?", self.name):
+            raise ValueError("warm_pool.name must be a short DNS label")
+        if self.pool_max < self.size:
+            raise ValueError("warm_pool.pool_max must be at least warm_pool.size")
+        return self
+
 DEFAULT_EGRESS_DISABLE_IPV6 = True
 
 
@@ -1570,6 +1676,10 @@ class AppConfig(BaseModel):
         default=None,
         description="Secure container runtime configuration (gVisor, Kata, Firecracker).",
     )
+    warm_pool: WarmPoolConfig = Field(
+        default_factory=WarmPoolConfig,
+        description="Pre-started sandbox pods claimed per person at create (WM-29).",
+    )
     @model_validator(mode="after")
     def validate_runtime_blocks(self) -> "AppConfig":
         if self.tenants is not None and self.tenants.enforce_ownership:
@@ -1605,6 +1715,21 @@ class AppConfig(BaseModel):
                 )
         else:
             raise ValueError(f"Unsupported runtime type '{self.runtime.type}'.")
+        if self.warm_pool.enabled:
+            if (
+                self.runtime.type != "kubernetes"
+                or self.kubernetes is None
+                or (self.kubernetes.workload_provider or "").lower() != "batchsandbox"
+            ):
+                raise ValueError("warm_pool requires Kubernetes with workload_provider=batchsandbox.")
+            if self.egress is None or not self.egress.image:
+                raise ValueError("warm_pool requires [egress] with an image: every warm pod carries the sidecar.")
+            if self.tenants is not None and not self.warm_pool.namespace:
+                raise ValueError("warm_pool.namespace is required with a tenant provider.")
+            if self.runtime.execd_run_as_init:
+                # bootstrap.sh starts the entrypoint at boot, with the pool's environment;
+                # execd-as-init would leave it unstarted after a runtime init that keeps it.
+                raise ValueError("warm_pool requires runtime.execd_run_as_init = false.")
         upstream_proxy = self.egress.upstream_proxy if self.egress else None
         if upstream_proxy is not None:
             if self.runtime.type == "docker" and upstream_proxy.ca_secret_name is not None:

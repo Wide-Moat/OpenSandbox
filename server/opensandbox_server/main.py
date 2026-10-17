@@ -196,6 +196,12 @@ async def lifespan(app: FastAPI):
 
     setup_otel_metrics(app_config.otel)
 
+    # WM-29: keep the warm pool, if this runtime has one. Started once the app is about
+    # to serve, so a server that cannot start never writes the Pool.
+    start_warm_pool = getattr(sandbox_service, "start_warm_pool", None)
+    if callable(start_warm_pool):
+        start_warm_pool()
+
     yield
 
     consumer = getattr(app.state, "renew_intent_consumer", None)

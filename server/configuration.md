@@ -322,6 +322,88 @@ See [`components/egress/README.md`](../components/egress/README.md) for sidecar 
 
 ---
 
+## `[warm_pool]` — pre-started pods claimed per person (WM-29)
+
+Off by default. When on, the server writes a `Pool` (named `name`, in `namespace`) whose pod
+template is rendered by the same builder as a cold create, then made warm: execd runs with
+`EXECD_RUNTIME_INIT=true` and `EXECD_RUNTIME_INIT_ONCE=true`, the egress sidecar starts with a
+deny-all policy, no vault, and a token derived from `OPENSANDBOX_EGRESS_TOKEN_KEY` (the Secret
+`egress_key_secret_name`, key `key`) and the pod's uid, and the home volume is an ephemeral
+claim created with the pod. The server creates that Secret when it is absent and reads it
+back (it needs `create`, and `get` on that one name, on Secrets in the pool namespace).
+
+A create is claimed from the pool only when it names the pool in
+`extensions["opensandbox.extensions.warm-pool"]` and matches it: same image, entrypoint,
+resources and `EXECD_BOOTSTRAP_PRE_SCRIPT`, a `networkPolicy` with `credentialProxy.enabled`,
+exactly one volume (a new home at `home_mount_path`), and no request lifecycle, platform,
+secure access or other shaping extension. A home that already exists -- by name, or through the
+`opensandbox.io/home-alias` label a claim leaves on its home -- is a resumed chat and goes cold,
+mounting that home. At the claim the server POSTs the policy and the vault seed to the sidecar,
+reserves the home name and takes the pod's home: an anchor ConfigMap named
+`osb-warm-home-<digest of the home name>` is created (only one create can make it; it records
+the home claim and is `claiming` until execd is bound, `committed` after), and becomes the home's
+second owner while the pod stays its controller -- the kubelet requires that of an ephemeral
+volume -- so the home outlives the pod and goes with its anchor when the reaper deletes it. The
+home is labelled with the alias and stamped with the owner and the claim time. Then the server
+binds execd with one `/internal/init` (token hash, the create's env, `claim_prestart` as
+preStart), checks the token on an authenticated route, and commits the anchor. A create for a
+home name whose anchor is still `claiming` is refused 503 ("This home is being prepared by another
+create; retry shortly."). A `claiming` anchor older than 5 minutes (its server died mid-claim) holds the name no longer. A
+committed anchor wins even over a claim that has the home name itself (only a cold create racing
+the warm claim makes one). A warm home named directly is refused 404 ("Volume not found"): it is
+reached only through its anchor. A pod made from an older rendering (label
+`opensandbox.io/warm-pool-template`) is never claimed, nor is a create whose environment sets
+anything execd or bootstrap.sh read at start (`EXECD_*`, `BOOTSTRAP_*`, `JUPYTER_*`,
+`OPENSANDBOX_LIFECYCLE`) differently from the pool. On a failed claim the server deletes the claim
+by name, releases the name and deletes the home it took, and creates cold; a cancelled request
+(shutdown, a caller's timeout) gets the same cleanup and stays cancelled. Cleanup is best effort,
+and what it misses is bounded: a claim BatchSandbox has the create's expireTime, the home is an
+`osb-` claim the reaper removes by age, its anchor goes with it, and a `claiming` anchor stops
+counting after 5 minutes. Failures are logged as `warm pool: could not delete failed claim ...`,
+`... could not release the home name ...`, `... could not delete the home ...`.
+
+The bound on a missed home depends on a reaper OUTSIDE this server: the warm homes are claims named
+`<pool name>-<suffix>-<home volume>`, so name the pool with your reaper's volume prefix (the
+Wide Moat platform chart's reaper deletes `osb-` claims unmounted for `reaper.volumeMaxAge`); with no
+such reaper a home whose cleanup failed stays until deleted by hand. A warm claim requires a
+`timeout`, so the claim itself always expires. Why a create went cold is logged as
+`warm pool <name>: cold create, <reason>` (a mismatch) or `warm pool <name>: claim of <pod> for
+sandbox <id> failed after {timeline}: <reason>` -- `the pool has no ready pod`, `no pod was
+allocated in time`, `home name already reserved by another claim (...)`, `pod ... predates the
+current pool template`, `sidecar refused the policy: ...`, `execd refused the binding: ...`,
+`execd does not accept the issued token: ...`, `sidecar refused the vault seed: ...`, `cannot read
+the warm pool key: ...`, `cannot create the warm pool key: ...`, `the warm pool key Secret has no
+`key``, `the claim ran out of its budget`, or `TimeoutError` when the pod did not answer within it. The budget is
+checked between steps and bounds every HTTP call to the pod; a Kubernetes call is not cut short.
+A cold create racing a warm claim for the same new home name (two replicas of a client creating
+one chat's sandbox at once) can leave both homes; the name then resolves to the warm one.
+`runtime.execd_run_as_init` must be off: the entrypoint starts at boot with the pool's
+environment.
+
+Refused at load: `warm_pool requires Kubernetes with workload_provider=batchsandbox.`,
+`warm_pool requires [egress] with an image: every warm pod carries the sidecar.`,
+`warm_pool.namespace is required with a tenant provider.`, `warm_pool.image is required when
+warm_pool.enabled`, `warm_pool.entrypoint must not be empty`, `warm_pool.name must be a short DNS
+label`, `warm_pool.pool_max must be at least warm_pool.size`, `warm_pool requires
+runtime.execd_run_as_init = false.`. The response carries
+`extensions["opensandbox.extensions.warm-claimed"] = "true"`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Keep the pool and claim from it. |
+| `resolve_claimed_homes` | bool | `false` (forced on with `enabled`) | Resolve a home name to the warm home claimed under it. Keep it on after switching the pool off. |
+| `name` | string | `osb-warm` | Pool name; pods are `<name>-<suffix>`, homes `<pod>-<home_volume_name>`. |
+| `namespace` | string | none | The pool's namespace; required with a tenant provider. |
+| `size` | int | `3` | Warm pods kept ready. |
+| `pool_max` | int | `24` | Controller ceiling for warm plus handed-out pods. |
+| `image`, `entrypoint`, `resource_limits`, `resource_requests` | | | What a matching create must ask for. |
+| `env` | map | `{}` | The sandbox container's environment while warm; nothing per person. |
+| `home_volume_name`, `home_mount_path`, `home_storage`, `home_storage_class` | | `home`, `/home/user`, `10Gi`, none | The warm home claim. |
+| `egress_key_secret_name` | string | `opensandbox-warm-pool-egress-key` | The Secret (key `key`) the sidecars derive their tokens from; made by the server. |
+| `claim_prestart`, `claim_prestart_timeout_seconds` | list, int | `[]`, `5` | Hook execd runs at the claim, with the create's env. |
+| `claim_timeout_seconds` | float | `3.0` | Budget for one claim before going cold. |
+| `reconcile_interval_seconds` | float | `60` | How often the Pool is compared with the rendering. |
+
 ## `[storage]`
 
 Host-side storage related to **volume mounts** (host bind allowlist and OSSFS mount layout).

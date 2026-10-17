@@ -151,8 +151,14 @@ class BatchSandboxProvider(WorkloadProvider):
         platform: Optional[PlatformSpec] = None,
         annotations: Optional[Dict[str, str]] = None,
         resource_requests: Optional[Dict[str, str]] = None,
+        render_only: bool = False,
     ) -> Dict[str, Any]:
-        """Create a BatchSandbox in template mode or pool mode."""
+        """Create a BatchSandbox in template mode or pool mode.
+
+        ``render_only`` returns the BatchSandbox a template-mode create would submit,
+        without submitting it -- the warm pool (WM-29) renders its pod template through
+        exactly this path, so a warm pod and a cold one are built by one builder.
+        """
         extensions = extensions or {}
         windows_profile = is_windows_profile(platform)
 
@@ -318,6 +324,8 @@ class BatchSandboxProvider(WorkloadProvider):
         )
         if platform is not None and not windows_profile:
             WorkloadProvider.ensure_platform_compatible_with_affinity(merged_pod_spec, platform)
+        if render_only:
+            return batchsandbox
 
         created = self.k8s_client.create_custom_object(
             group=self.group,
@@ -444,6 +452,47 @@ class BatchSandboxProvider(WorkloadProvider):
             body=runtime_manifest,
         )
         
+        return {
+            "name": created["metadata"]["name"],
+            "uid": created["metadata"]["uid"],
+            "apiVersion": f"{self.group}/{self.version}",
+            "kind": "BatchSandbox",
+        }
+
+    def create_warm_claim(
+        self,
+        batchsandbox_name: str,
+        namespace: str,
+        labels: Dict[str, str],
+        annotations: Dict[str, str],
+        pool_ref: str,
+        expires_at: Optional[datetime],
+    ) -> Dict[str, Any]:
+        """A BatchSandbox that takes one pod of a warm Pool and runs nothing in it (WM-29).
+
+        No taskTemplate: the pod is already running everything it needs, and the claim's
+        per-person state is pushed into it by the server, not started by the controller.
+        """
+        spec: Dict[str, Any] = {"replicas": 1, "poolRef": pool_ref}
+        if expires_at is not None:
+            spec["expireTime"] = expires_at.isoformat()
+        created = self.k8s_client.create_custom_object(
+            group=self.group,
+            version=self.version,
+            namespace=namespace,
+            plural=self.plural,
+            body={
+                "apiVersion": f"{self.group}/{self.version}",
+                "kind": "BatchSandbox",
+                "metadata": {
+                    "name": batchsandbox_name,
+                    "namespace": namespace,
+                    "labels": labels,
+                    "annotations": annotations,
+                },
+                "spec": spec,
+            },
+        )
         return {
             "name": created["metadata"]["name"],
             "uid": created["metadata"]["uid"],

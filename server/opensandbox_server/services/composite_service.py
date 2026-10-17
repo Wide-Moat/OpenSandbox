@@ -54,6 +54,10 @@ class CompositeSandboxService(SandboxService, ExtensionService):
         self._fsb.close()
         self._kubernetes.close()
 
+    def start_warm_pool(self) -> None:
+        """WM-29: the warm pool belongs to the Kubernetes backend."""
+        self._kubernetes.start_warm_pool()
+
     async def create_sandbox(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
         # templateId is the unambiguous fsb selector: fsb sandboxes are
         # the microVM catalog and coexist with the container-sandbox
