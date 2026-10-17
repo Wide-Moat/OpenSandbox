@@ -242,7 +242,7 @@ _sudo() {
 OPENSANDBOX_MERGED_CA=""
 trust_mitm_ca() {
 	cert="$1"
-	merged="/opt/opensandbox/merged-ca-certificates.pem"
+	merged="${OPENSANDBOX_MERGED_CA_FILE:-/opt/opensandbox/merged-ca-certificates.pem}"
 
 	# 1) Try to install into the system trust store (best-effort).
 	if command -v update-ca-certificates >/dev/null 2>&1; then
@@ -415,28 +415,120 @@ trust_mitm_ca_jdk() {
 	return 0
 }
 
-MITM_CA="/opt/opensandbox/mitmproxy-ca-cert.pem"
-if is_truthy "${OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT:-}"; then
-	i=0
-	while [ "$i" -lt 300 ]; do
-		if [ -f "$MITM_CA" ] && [ -s "$MITM_CA" ]; then
+# The paths below default to where the image puts them. The overrides exist so that a test can run
+# this script without root and without touching /opt or /tmp (WM-28).
+MITM_CA="${OPENSANDBOX_MITM_CA_FILE:-/opt/opensandbox/mitmproxy-ca-cert.pem}"
+OPENSANDBOX_MERGED_CA_FILE="${OPENSANDBOX_MERGED_CA_FILE:-/opt/opensandbox/merged-ca-certificates.pem}"
+# THE DONE MARKER (WM-28). A fixed, documented path: /tmp/.opensandbox-ca-trust-done unless
+# OPENSANDBOX_CA_TRUST_DONE_FILE says otherwise. It is removed when bootstrap starts and
+# written once the trust step has finished, in every path: interception off, the CA never
+# appearing, the imports done in the foreground, the imports done in the background. It
+# means "the trust step is over, successfully or not" and NOT "the CA is trusted": a
+# failed import only warns. A caller that must not run Chromium or Java before then waits
+# for the file, with a bound of its own.
+CA_TRUST_DONE_FILE="${OPENSANDBOX_CA_TRUST_DONE_FILE:-/tmp/.opensandbox-ca-trust-done}"
+# What the background imports print. They cannot share bootstrap's stdout and stderr: a
+# caller reading them through a pipe would not see EOF until the imports finished.
+CA_TRUST_LOG="${OPENSANDBOX_CA_TRUST_LOG:-/tmp/.opensandbox-ca-trust.log}"
+
+# The redirection runs in a subshell: a failed redirection on a special builtin such as `:`
+# aborts a POSIX shell (dash), and the trust step must never be what stops bootstrap.
+_ca_trust_done() {
+	( : > "$CA_TRUST_DONE_FILE" ) 2>/dev/null || true
+}
+rm -f "$CA_TRUST_DONE_FILE" 2>/dev/null || true
+
+# Milliseconds since the epoch. Fractional seconds are not POSIX: where date has no %N it
+# prints a literal one, which is not a number, and whole seconds are used instead.
+_now_ms() {
+	_ms="$(date +%s%N 2>/dev/null)"
+	case "$_ms" in
+	"" | *[!0-9]*) echo $(($(date +%s) * 1000)) ;;
+	*) echo $((_ms / 1000000)) ;;
+	esac
+}
+
+if ! is_truthy "${OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT:-}"; then
+	_ca_trust_done
+else
+	# Poll every 50 ms; the CA usually appears about a second after the container starts, and
+	# a 1 s poll costs up to 0.9 s of every sandbox start. Where sleep takes no fraction, poll
+	# every second. The budget is 300 s of the clock either way, counted in time and not in
+	# tries, so the finer poll does not shrink it; the try count is only a backstop against a
+	# clock that moves backwards.
+	_wait_budget_ms=300000
+	_wait_start_ms="$(_now_ms)"
+	# ONE readiness decision, taken where the wait ends: 1 when the CA is there, 0 on timeout.
+	# A timeout means no imports and the marker; a CA means the imports and then the marker.
+	# Looking at the file a second time would let a CA that arrives in between publish the
+	# marker before its imports.
+	_ca_ready=0
+	_wait_ticks=0
+	_wait_step=0.05
+	_wait_max_ticks=$((_wait_budget_ms / 50))
+	_wait_elapsed_ms=0
+	# The probe is the first tick of a wait that is going to happen anyway.
+	if [ ! -s "$MITM_CA" ]; then
+		if ! sleep "$_wait_step" 2>/dev/null; then
+			_wait_step=1
+			_wait_max_ticks=$((_wait_budget_ms / 1000))
+			sleep 1
+		fi
+		_wait_ticks=1
+	fi
+	while [ ! -s "$MITM_CA" ]; do
+		_wait_elapsed_ms=$(($(_now_ms) - _wait_start_ms))
+		if [ "$_wait_elapsed_ms" -ge "$_wait_budget_ms" ] || [ "$_wait_ticks" -ge "$_wait_max_ticks" ]; then
 			break
 		fi
-		sleep 1
-		i=$((i + 1))
+		sleep "$_wait_step"
+		_wait_ticks=$((_wait_ticks + 1))
 	done
 	if [ ! -f "$MITM_CA" ] || [ ! -s "$MITM_CA" ]; then
-		echo "warning: timed out after 300s waiting for $MITM_CA (egress mitm CA export); continuing without system CA trust" >&2
+		echo "warning: timed out after $((_wait_elapsed_ms / 1000))s waiting for $MITM_CA (egress mitm CA export); continuing without system CA trust" >&2
+		_ca_trust_done
 	else
-		echo "mitm CA ready at $MITM_CA after ${i}s"
+		_ca_ready=1
+		_wait_elapsed_ms=$(($(_now_ms) - _wait_start_ms))
+		echo "mitm CA ready at $MITM_CA after ${_wait_elapsed_ms}ms"
 		if ! trust_mitm_ca "$MITM_CA"; then
 			echo "warning: failed to install mitm CA into system trust store; TLS interception may not work for system libraries" >&2
 		fi
 	fi
 
-	if [ -f "$MITM_CA" ] && [ -s "$MITM_CA" ]; then
-		trust_mitm_ca_nss "$MITM_CA" || true
-		trust_mitm_ca_jdk "$MITM_CA" || true
+	if [ "$_ca_ready" -eq 1 ]; then
+		# NSS (Chromium) and the JDK stores cost about a second between them. By default they
+		# are imported here, before execd starts, as they always were. With
+		# OPENSANDBOX_CA_TRUST_BACKGROUND=true they are imported in a background subshell and
+		# execd does not wait for them: a Chromium or Java started in that second can miss
+		# the CA, and a caller that cares waits for the done marker. The subshell ignores
+		# SIGHUP, takes no input and writes to a file, so it neither dies with this shell nor
+		# keeps its stdout open; when bootstrap execs into execd the job carries on under it.
+		# A failed import only warns, either way.
+		# The log is opened here first: if it cannot be, the async subshell would die on its
+		# redirection before importing anything or writing the marker, so the imports are
+		# done in the foreground instead.
+		_ca_bg=0
+		if is_truthy "${OPENSANDBOX_CA_TRUST_BACKGROUND:-}"; then
+			if ( : >> "$CA_TRUST_LOG" ) 2>/dev/null; then
+				_ca_bg=1
+			else
+				echo "warning: cannot write $CA_TRUST_LOG; importing the CA into NSS and the JDK in the foreground" >&2
+			fi
+		fi
+		if [ "$_ca_bg" -eq 1 ]; then
+			(
+				trap '' HUP
+				trust_mitm_ca_nss "$MITM_CA" || true
+				trust_mitm_ca_jdk "$MITM_CA" || true
+				_ca_trust_done
+			) </dev/null >"$CA_TRUST_LOG" 2>&1 &
+			echo "mitm CA trust for NSS and JDK continues in the background (log $CA_TRUST_LOG, done marker $CA_TRUST_DONE_FILE)"
+		else
+			trust_mitm_ca_nss "$MITM_CA" || true
+			trust_mitm_ca_jdk "$MITM_CA" || true
+			_ca_trust_done
+		fi
 		export NODE_EXTRA_CA_CERTS="$MITM_CA"  # additive — Node appends to built-in roots
 
 		# REQUESTS_CA_BUNDLE and SSL_CERT_FILE replace the default bundle,
