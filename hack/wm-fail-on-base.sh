@@ -542,6 +542,9 @@ copy components/egress/credential_vault_api_wait_test.go
 copy components/egress/cleanup_sleep_test.go
 copy kubernetes/cmd/controller/watch_namespaces_flag_test.go
 copy components/execd/pkg/web/internal_init_test.go
+# WM-26: runtime-init-once, switched on through EXECD_RUNTIME_INIT_ONCE and InitFlags, so the
+# test compiles on upstream and fails on what a second /internal/init answers.
+copy components/execd/pkg/web/runtime_init_once_test.go
 copy kubernetes/internal/task-executor/runtime/process_test.go
 # WM-9's pause preflight. The test sets the registry through reflection, so on upstream,
 # where the reconciler has no such field, it compiles and fails on what pause does.

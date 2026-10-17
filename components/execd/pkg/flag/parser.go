@@ -33,6 +33,7 @@ const (
 	jupyterIdlePollIntervalEnv = "EXECD_JUPYTER_IDLE_POLL_INTERVAL"
 	isolationConfigEnv         = "EXECD_ISOLATION_CONFIG"
 	runtimeInitEnv             = "EXECD_RUNTIME_INIT"
+	runtimeInitOnceEnv         = "EXECD_RUNTIME_INIT_ONCE"
 )
 
 // InitFlags registers CLI flags and env overrides.
@@ -46,6 +47,7 @@ func InitFlags() {
 	InitMode = false
 	LifecycleStartupStatusFile = ""
 	RuntimeInit = false
+	RuntimeInitOnce = false
 
 	// First, set default values from environment variables
 	if jupyterFromEnv := os.Getenv(jupyterHostEnv); jupyterFromEnv != "" {
@@ -111,6 +113,15 @@ func InitFlags() {
 		RuntimeInit = enabled
 	}
 	flag.BoolVar(&RuntimeInit, "runtime-init", RuntimeInit, "Gate preStart and the entrypoint on POST /internal/init; until then only /ping, /ready, and /internal/init are served")
+
+	if onceFromEnv := os.Getenv(runtimeInitOnceEnv); onceFromEnv != "" {
+		enabled, err := strconv.ParseBool(onceFromEnv)
+		if err != nil {
+			stdlog.Panicf("Invalid %s=%s: must be a boolean value", runtimeInitOnceEnv, onceFromEnv)
+		}
+		RuntimeInitOnce = enabled
+	}
+	flag.BoolVar(&RuntimeInitOnce, "runtime-init-once", RuntimeInitOnce, "With --runtime-init: accept exactly one successful POST /internal/init (it must carry accessTokenHash); every later one answers 409")
 
 	// Parse flags - these will override environment variables if provided
 	flag.Parse()
