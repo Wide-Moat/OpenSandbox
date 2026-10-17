@@ -557,17 +557,35 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                         last_state = current_state
                         last_message = current_message
 
-                    if current_state in ("Running", "Allocated"):
-                        if not self.app_config.kubernetes.wait_for_execd:
+                    wait_for_execd = self.app_config.kubernetes.wait_for_execd
+                    if current_state in ("Running", "Allocated") or (
+                        # WM-32: a BatchSandbox's controller-written phase stays Pending until
+                        # the pod is Ready, and the phase wins over the pod's address in
+                        # get_status -- so a cold create never reads Allocated, and asking
+                        # execd from Allocated on alone would wait for Ready after all
+                        # (measured on stage 2026-10-17: the address was published 5 s before
+                        # the phase moved). An address is what the probe needs.
+                        wait_for_execd and current_state == "Pending" and self._pod_ip_of(workload)
+                    ):
+                        if not wait_for_execd:
                             return workload
                         # WM-30: Running/Allocated is the pod's view, and Allocated is not
                         # even Ready. What the caller does next is talk to execd, so the
                         # answer waits for execd itself -- asked directly, every 50 ms,
                         # instead of the kubelet's 1 s startup probe and the status write
-                        # behind it.
-                        if await self._sandbox_answers(workload):
-                            return workload
-                        await asyncio.sleep(0.05)
+                        # behind it. WM-32: the workload is re-read once per poll interval,
+                        # not on every probe -- a burst of creates would otherwise be twenty
+                        # GETs a second each against the API server.
+                        probe_until = time.monotonic() + max(poll_interval_seconds, 0.05)
+                        while True:
+                            if await self._sandbox_answers(workload):
+                                return workload
+                            if (
+                                time.monotonic() >= probe_until
+                                or time.monotonic() - start_time >= timeout_seconds
+                            ):
+                                break
+                            await asyncio.sleep(0.05)
                         continue
                     if _is_unschedulable_status(status_info):
                         raise HTTPException(
@@ -674,12 +692,16 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             if unsubscribe is not None:
                 unsubscribe()
 
+    def _pod_ip_of(self, workload: Dict[str, Any]) -> Optional[str]:
+        parse = getattr(self.workload_provider, "_parse_pod_ip", None)
+        pod_ip = parse(workload) if callable(parse) else None
+        return pod_ip if isinstance(pod_ip, str) and pod_ip else None
+
     async def _sandbox_answers(self, workload: Dict[str, Any]) -> bool:
         """execd answers /ping on the pod's address, and the egress sidecar /healthz when the
         sandbox has one (WM-30). Both are unauthenticated by design, and the server is the
         one client the sandbox namespace admits on both ports."""
-        parse = getattr(self.workload_provider, "_parse_pod_ip", None)
-        pod_ip = parse(workload) if callable(parse) else None
+        pod_ip = self._pod_ip_of(workload)
         if not pod_ip:
             return False
         annotations = (workload.get("metadata") or {}).get("annotations") or {}
