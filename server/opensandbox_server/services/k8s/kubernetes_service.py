@@ -52,6 +52,7 @@ from opensandbox_server.api.schema import (
 )
 from opensandbox_server.config import AppConfig, INGRESS_MODE_GATEWAY, SecureAccessConfig, get_config
 from opensandbox_server.services.constants import (
+    EXECD_PORT,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_EXECD_ACCESS_TOKEN_METADATA_KEY,
     SANDBOX_ID_LABEL,
@@ -557,7 +558,17 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                         last_message = current_message
 
                     if current_state in ("Running", "Allocated"):
-                        return workload
+                        if not self.app_config.kubernetes.wait_for_execd:
+                            return workload
+                        # WM-30: Running/Allocated is the pod's view, and Allocated is not
+                        # even Ready. What the caller does next is talk to execd, so the
+                        # answer waits for execd itself -- asked directly, every 50 ms,
+                        # instead of the kubelet's 1 s startup probe and the status write
+                        # behind it.
+                        if await self._sandbox_answers(workload):
+                            return workload
+                        await asyncio.sleep(0.05)
+                        continue
                     if _is_unschedulable_status(status_info):
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
@@ -662,6 +673,30 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             active = False
             if unsubscribe is not None:
                 unsubscribe()
+
+    async def _sandbox_answers(self, workload: Dict[str, Any]) -> bool:
+        """execd answers /ping on the pod's address, and the egress sidecar /healthz when the
+        sandbox has one (WM-30). Both are unauthenticated by design, and the server is the
+        one client the sandbox namespace admits on both ports."""
+        parse = getattr(self.workload_provider, "_parse_pod_ip", None)
+        pod_ip = parse(workload) if callable(parse) else None
+        if not pod_ip:
+            return False
+        annotations = (workload.get("metadata") or {}).get("annotations") or {}
+        # An IPv6 literal goes in brackets in a URL's authority.
+        host = f"[{pod_ip}]" if ":" in pod_ip and not pod_ip.startswith("[") else pod_ip
+        urls = [f"http://{host}:{EXECD_PORT}/ping"]
+        if annotations.get(SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY):
+            urls.append(f"http://{host}:18080/healthz")
+        try:
+            async with httpx.AsyncClient(timeout=0.5, trust_env=False) as client:
+                for url in urls:
+                    response = await client.get(url)
+                    if response.status_code != 200:
+                        return False
+        except httpx.HTTPError:
+            return False
+        return True
 
     @staticmethod
     def _pool_capacity_exhausted_error(

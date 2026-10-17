@@ -147,6 +147,7 @@ If `runtime.type = "kubernetes"` and the `[kubernetes]` table is absent, the ser
 | `sandbox_create_timeout_seconds` | integer | `60` | Max time to wait for a new sandbox to become ready (e.g. IP assigned), in seconds. |
 | `pool_acquisition_timeout_seconds` | integer | `30` | Max cumulative time to wait while Pool capacity prevents allocation. This does not extend `sandbox_create_timeout_seconds`. |
 | `sandbox_create_poll_interval_seconds` | float | `1.0` | Fallback status-check interval when no workload change notification arrives during creation. |
+| `wait_for_execd` | bool | `false` | WM-30: a create answers only once execd answers `/ping` on the pod address (and the egress sidecar `/healthz` when there is one), asked every 50 ms, instead of at the first Running/Allocated status. The server must reach the sandbox namespace on 44772 and 18080. BatchSandbox provider only: with any other, loading refuses with `kubernetes.wait_for_execd requires workload_provider=batchsandbox.` |
 | `informer_resync_seconds` | integer | `300` | **[Beta]** Full resync period for the informer cache. |
 | `informer_watch_timeout_seconds` | integer | `60` | **[Beta]** Watch stream restart interval. |
 | `read_qps` | float | `0` | K8s API **get/list** rate limit (QPS). **0** = unlimited. |

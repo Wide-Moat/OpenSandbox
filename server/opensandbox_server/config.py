@@ -752,6 +752,15 @@ class KubernetesRuntimeConfig(BaseModel):
             "prevents sandbox allocation. The overall sandbox create timeout still applies."
         ),
     )
+    wait_for_execd: bool = Field(
+        default=False,
+        description=(
+            "WM-30: a create answers only once execd answers /ping on the pod's address "
+            "(and the egress sidecar /healthz when there is one), asked by the server every "
+            "50 ms -- not when the workload reports Running or Allocated. Needs the server "
+            "to reach the sandbox namespace on 44772 and 18080."
+        ),
+    )
     sandbox_create_poll_interval_seconds: float = Field(
         default=1.0,
         gt=0,
@@ -1715,6 +1724,12 @@ class AppConfig(BaseModel):
                 )
         else:
             raise ValueError(f"Unsupported runtime type '{self.runtime.type}'.")
+        if (
+            self.kubernetes is not None
+            and self.kubernetes.wait_for_execd
+            and (self.kubernetes.workload_provider or "").lower() != "batchsandbox"
+        ):
+            raise ValueError("kubernetes.wait_for_execd requires workload_provider=batchsandbox.")
         if self.warm_pool.enabled:
             if (
                 self.runtime.type != "kubernetes"

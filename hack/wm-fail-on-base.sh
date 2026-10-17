@@ -589,6 +589,8 @@ copy server/tests/k8s/test_wm25_seed_secret_behaviour.py
 # WM-29: the warm claim, configured through a key upstream's AppConfig ignores and reached only
 # through create_sandbox; upstream creates cold, so nothing is claimed or pushed.
 copy server/tests/k8s/test_wm29_warm_pool_behaviour.py
+# WM-30: execd asked directly; upstream returns at the first Running/Allocated without asking.
+copy server/tests/k8s/test_wm30_execd_answers_behaviour.py
 # WM-21: the credential proxy addon's own tests, run against upstream's system.py.
 copy components/egress/tests/test_mitmscripts_system.py
 
