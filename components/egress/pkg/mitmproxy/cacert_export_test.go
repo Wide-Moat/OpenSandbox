@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/alibaba/opensandbox/egress/pkg/constants"
 )
 
 func TestCandidateCACertPaths(t *testing.T) {
@@ -98,4 +100,66 @@ func TestSyncRootCAFastSandboxExportsToSubdirWithoutSystemTrust(t *testing.T) {
 	for _, e := range entries {
 		require.NotEqual(t, "usr", e.Name(), "system trust install must be skipped for the fast-sandbox export")
 	}
+}
+
+// The guard on WM-31: in-pod (sidecar) enforcement keeps upstream's behaviour -- the
+// export adds the CA to the system store, through update-ca-certificates, before it
+// answers. The store is pointed at a temporary directory and the tool is a stub on PATH.
+func TestWM31SidecarEnforcementStillWritesTheSystemTrustStore(t *testing.T) {
+	t.Setenv(constants.EnvEnforcement, "")
+	root := t.TempDir()
+	home := filepath.Join(root, "mitmhome")
+	confdir := filepath.Join(home, ".mitmproxy")
+	require.NoError(t, os.MkdirAll(confdir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(confdir, mitmCACertName), []byte("wm31-ca"), 0o644))
+	bin := filepath.Join(root, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	marker := filepath.Join(root, "update-ca-certificates.ran")
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "update-ca-certificates"), []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	trust := filepath.Join(root, "ca-certificates")
+	orig := systemTrustDir
+	systemTrustDir = trust
+	t.Cleanup(func() { systemTrustDir = orig })
+
+	require.NoError(t, exportRootCA(confdir, home, filepath.Join(root, "opt"), true))
+
+	_, err := os.Stat(marker)
+	require.NoError(t, err, "update-ca-certificates was not run under sidecar enforcement")
+	installed, err := os.ReadFile(filepath.Join(trust, "opensandbox-mitmproxy-ca.crt"))
+	require.NoError(t, err)
+	require.Equal(t, "wm31-ca", string(installed))
+}
+
+// WM-31 on any host: under external enforcement the export never runs
+// update-ca-certificates and never writes the system store -- here a temporary directory --
+// while the sandbox's copy is in place. (system_trust_wm31_test.go proves the same with
+// upstream symbols only, where the host allows it.)
+func TestWM31ExternalEnforcementWritesNoSystemTrustStore(t *testing.T) {
+	t.Setenv(constants.EnvEnforcement, constants.EnforcementExternal)
+	root := t.TempDir()
+	home := filepath.Join(root, "mitmhome")
+	confdir := filepath.Join(home, ".mitmproxy")
+	require.NoError(t, os.MkdirAll(confdir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(confdir, mitmCACertName), []byte("wm31-ca"), 0o644))
+	bin := filepath.Join(root, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	marker := filepath.Join(root, "update-ca-certificates.ran")
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "update-ca-certificates"), []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	trust := filepath.Join(root, "ca-certificates")
+	orig := systemTrustDir
+	systemTrustDir = trust
+	t.Cleanup(func() { systemTrustDir = orig })
+	rootDir := filepath.Join(root, "opt")
+
+	require.NoError(t, exportRootCA(confdir, home, rootDir, true))
+
+	content, err := os.ReadFile(filepath.Join(rootDir, mitmCACertName))
+	require.NoError(t, err)
+	require.Equal(t, "wm31-ca", string(content))
+	_, err = os.Stat(marker)
+	require.True(t, os.IsNotExist(err), "update-ca-certificates was run under external enforcement")
+	_, err = os.Stat(trust)
+	require.True(t, os.IsNotExist(err), "the system store was written under external enforcement")
 }
