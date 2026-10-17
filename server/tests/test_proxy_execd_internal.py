@@ -176,14 +176,37 @@ INTERNAL_SPELLINGS = [
     f"{_PREFIX}/internal/init%3F",
     f"{_PREFIX}/internal/init%3F/../x",
     f"{_PREFIX}/internal/init%3F/../../x",
-    f"{_PREFIX}/internal/init%3F/../../../x",
     f"{_PREFIX}/internal/init%3F/%2E%2E/%2E%2E/x",
-    f"{_PREFIX}/internal%2Finit%3F/../../x",
     f"{_PREFIX}/internal/init%23",
     f"{_PREFIX}/internal/init%23/../x",
     f"{_PREFIX}/internal/init%23/../../x",
-    f"{_PREFIX}/internal/init%23/../../../x",
     f"{_PREFIX}/proxy/44772/internal/init%3F/../../../../z",
+    # Encoded spellings the proxy now forwards exactly as sent (upstream 1d4e2fab): the
+    # guard judges that same still-encoded string and every decoding of it.
+    f"{_PREFIX}/files/%2E%2E/internal/init",
+    f"{_PREFIX}/files/%2e%2E/internal/init",
+    f"{_PREFIX}/%2Finternal/init",
+    f"{_PREFIX}/files%2F..%2Finternal%2Finit",
+    f"{_PREFIX}/files/%2e%2e%2finternal%2finit",
+    f"{_PREFIX}/files%5C..%5Cinternal%5Cinit",
+    f"{_PREFIX}/%252569nternal/init",
+    f"{_PREFIX}/%25252569nternal/init",
+    f"{_PREFIX}/files/%25252e%25252e/internal/init",
+    f"{_PREFIX}/proxy%2F44772%2Finternal%2Finit",
+    f"{_PREFIX}/proxy/44772/%69nternal/init",
+    f"{_PREFIX}/proxy/44772/files/%2e%2e/internal/init",
+    f"{_PREFIX}/proxy/%34%34772/internal/init",
+]
+
+# A "?" or "#" that stays encoded is not a split to the proxy that forwards it, and the
+# dots after it climb out of the port the path names: refused by the climb check before
+# the execd check is asked. Before upstream 1d4e2fab the proxy forwarded the decoded
+# path, the split came first, and the same requests were refused by the execd check.
+# Either refusal keeps the request away from execd; the test pins which one answers.
+INTERNAL_SPELLINGS_THAT_CLIMB = [
+    f"{_PREFIX}/internal/init%3F/../../../x",
+    f"{_PREFIX}/internal%2Finit%3F/../../x",
+    f"{_PREFIX}/internal/init%23/../../../x",
 ]
 
 
@@ -208,6 +231,23 @@ async def test_wm11_http_proxy_refuses_execd_internal_routes(
     assert service.calls == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", INTERNAL_SPELLINGS_THAT_CLIMB)
+@pytest.mark.parametrize("method", ["POST", "GET"])
+@pytest.mark.parametrize("authenticated", [True, False])
+async def test_wm11_http_proxy_refuses_internal_spellings_that_climb_once_encoded(
+    wired, auth_headers: dict, path: str, method: str, authenticated: bool
+) -> None:
+    client, service, http, _ = wired
+
+    status, body = await _http(client.app, path, auth_headers if authenticated else {}, method)
+
+    assert status == 400, f"{method} {path} was not refused as a climb: {status} {body!r}"
+    assert b"PROXY_PATH_LEAVES_PORT" in body
+    assert http.built is None, "the request must not be forwarded"
+    assert service.calls == []
+
+
 # The threat as it arrives: no API key at all. In single-tenant mode the proxy route is
 # exempt from the key, so for these the refusal here is the only thing in the way.
 ANONYMOUS_SPELLINGS = [
@@ -216,6 +256,12 @@ ANONYMOUS_SPELLINGS = [
     f"{_PREFIX}/proxy/44772/internal/init",
     f"{_PREFIX}/internal/init%3F/../../x",
     f"{_PREFIX}/internal/init%23/../../x",
+    f"{_PREFIX}/%69nternal/init",
+    # Twice encoded: the key check's ".." test sees %2e%2e and lets it by, so only the
+    # refusal here stands between an anonymous caller and execd. (Once encoded, the key
+    # check already answers 401.)
+    f"{_PREFIX}/files/%252e%252e/internal/init",
+    f"{_PREFIX}/%2569nternal/init",
 ]
 
 
@@ -241,6 +287,12 @@ async def test_wm11_http_proxy_refuses_an_anonymous_caller(wired, path: str) -> 
         f"{_PREFIX}/proxy/44772/internal/init",
         f"{_PREFIX}/internal/init%3F/../../x",
         f"{_PREFIX}/internal/init%23/../../x",
+        f"{_PREFIX}/%69nternal/init",
+        f"{_PREFIX}/%2569nternal/init",
+        f"{_PREFIX}/files/%2e%2e/internal/init",
+        f"{_PREFIX}/files%2F..%2Finternal%2Finit",
+        f"{_PREFIX}/proxy/44772/internal%2Finit",
+        f"{_PREFIX}/proxy%2F44772%2Finternal%2Finit",
     ],
 )
 @pytest.mark.parametrize("authenticated", [True, False])
@@ -449,20 +501,35 @@ async def test_wm11_a_websocket_caller_cannot_name_the_gateway_route(
             "http://10.0.0.7:8080/internal/init",
         ),
         # Encoded over and over, and never anything but a file path: forwarded. A cap on
-        # the decoding is a reason to stop looking, not a reason to refuse. Decoded once,
-        # by uvicorn, and forwarded with the rest still encoded: five rounds are needed
-        # to reach "A", one more than the cap, so the check runs out rather than
-        # settling -- the branch a refusal-on-cap would break.
+        # the decoding is a reason to stop looking, not a reason to refuse. Six rounds
+        # are needed to reach "A" from what is forwarded, more than the cap, so the
+        # check runs out rather than settling -- the branch a refusal-on-cap would break.
+        # Forwarded as sent since upstream 1d4e2fab, decoded once before it: this guard
+        # is about being forwarded, not about the encoding, and holds on both.
         (
             f"{_PREFIX}/files/%252525252541",
-            "http://10.0.0.7:44772/files/%2525252541",
+            (
+                "http://10.0.0.7:44772/files/%252525252541",
+                "http://10.0.0.7:44772/files/%2525252541",
+            ),
         ),
         # "4477²" is not a port to Go, which dials ASCII digits only, so execd answers
         # this one itself -- and it must reach execd, not end in a 500 here because
         # "²" passes str.isdigit() and then fails int().
         (
             f"{_PREFIX}/proxy/4477%C2%B2/internal/init",
-            "http://10.0.0.7:44772/proxy/4477²/internal/init",
+            (
+                "http://10.0.0.7:44772/proxy/4477%C2%B2/internal/init",
+                "http://10.0.0.7:44772/proxy/4477²/internal/init",
+            ),
+        ),
+        # Port 9223 is not execd: an encoded internal there is Chromium's business.
+        (
+            f"{_PREFIX}/proxy/9223/%69nternal/init",
+            (
+                "http://10.0.0.7:44772/proxy/9223/%69nternal/init",
+                "http://10.0.0.7:44772/proxy/9223/internal/init",
+            ),
         ),
     ],
 )
@@ -478,7 +545,8 @@ async def test_wm11_http_proxy_still_forwards_everything_else(
 
     assert status == 200, body
     assert body == b"backend"
-    assert http.built["url"] == forwarded_to
+    accepted = (forwarded_to,) if isinstance(forwarded_to, str) else forwarded_to
+    assert http.built["url"] in accepted
 
 
 def test_wm11_websocket_proxy_still_reaches_cdp_through_execd(
