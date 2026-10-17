@@ -1031,13 +1031,18 @@ def _wm8_sidecar_env(seed):
         "sbx-1",
     )
     sidecar = next(c for c in containers if c["name"] == "egress")
-    return {e["name"]: e["value"] for e in sidecar["env"]}
+    return {e["name"]: e for e in sidecar["env"]}
+
+
+# WM-25: on Kubernetes the variable names the sandbox's seed Secret instead of carrying the
+# value; the provider creates that Secret (test_wm25_seed_secret_behaviour.py).
+_WM8_SEED_SECRET_REF = {"name": "opensandbox-vault-seed-sbx-1", "key": "seed"}
 
 
 def test_wm8_seed_travels_in_the_sidecar_environment():
     env = _wm8_sidecar_env(_WM8_SEED)
     assert _WM8_SEED_ENV in env
-    assert json.loads(env[_WM8_SEED_ENV]) == _WM8_SEED
+    assert env[_WM8_SEED_ENV].get("valueFrom", {}).get("secretKeyRef") == _WM8_SEED_SECRET_REF
 
 
 def test_wm8_no_seed_is_the_default():
@@ -1060,12 +1065,15 @@ def test_wm8_the_secret_reaches_the_sidecar_and_nothing_else():
     sidecar = next(c for c in containers if c["name"] == "egress")
     sandbox = next(c for c in containers if c["name"] == "sandbox")
 
-    # The half that fails on a tree with no seeding: it must actually be delivered.
-    sidecar_env = {e["name"]: e["value"] for e in sidecar["env"]}
+    # The half that fails on a tree with no seeding: it must actually be delivered -- as a
+    # reference to the sandbox's seed Secret (WM-25).
+    sidecar_env = {e["name"]: e for e in sidecar["env"]}
     assert _WM8_SEED_ENV in sidecar_env
-    assert "s3cret-value" in sidecar_env[_WM8_SEED_ENV]
+    assert sidecar_env[_WM8_SEED_ENV].get("valueFrom", {}).get("secretKeyRef") == _WM8_SEED_SECRET_REF
 
-    # And the half that is the security property: nowhere the sandbox can read it.
+    # And the half that is the security property: nowhere the sandbox can read it, and
+    # since WM-25 nowhere in the spec at all.
     rendered = json.dumps(sandbox)
     assert "s3cret-value" not in rendered
     assert _WM8_SEED_ENV not in rendered
+    assert "s3cret-value" not in json.dumps(containers)

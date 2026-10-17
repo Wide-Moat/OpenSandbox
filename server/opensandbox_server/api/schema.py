@@ -166,10 +166,10 @@ class CredentialProxyConfig(BaseModel):
             "API, which can only happen after this create call has returned -- too "
             "late for a credential the sandbox needs while it boots. Delivered in the "
             "egress sidecar's environment only; the sandbox container cannot read it. "
-            "That environment is a plain-text value in the sidecar's spec -- the Pod "
-            "and the BatchSandbox on Kubernetes, the container's configuration on "
-            "Docker -- so whoever can read those objects can read the seed, as they "
-            "can the sidecar's other credentials."
+            "On Kubernetes that variable references a Secret of the sandbox's own, "
+            "owned by its workload and deleted with it, so the seed appears in neither "
+            "the Pod nor the workload's spec. On Docker it is a plain-text value in the "
+            "container's configuration, readable by whoever can inspect the sidecar."
         ),
     )
 

@@ -30,6 +30,9 @@ from opensandbox_server.extensions.keys import BOOTSTRAP_EXECD_ISOLATION_KEY
 from opensandbox_server.services.constants import OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT
 from opensandbox_server.services.helpers import format_ingress_endpoint
 from opensandbox_server.api.schema import Endpoint, ImageSpec, PlatformSpec, Volume
+from opensandbox_server.services.k8s.credential_vault_seed_secret import (
+    create_credential_vault_seed_secret,
+)
 from opensandbox_server.services.k8s.image_pull_secret_helper import (
     build_image_pull_secret,
     build_image_pull_secret_name,
@@ -350,6 +353,24 @@ class BatchSandboxProvider(WorkloadProvider):
                 except Exception as del_exc:
                     logger.warning(f"Failed to rollback BatchSandbox {sandbox_id}: {del_exc}")
                 raise
+
+        create_credential_vault_seed_secret(
+            self.k8s_client,
+            namespace=namespace,
+            sandbox_id=sandbox_id,
+            seed=egress_settings.credential_vault_seed if egress_settings is not None else None,
+            created=created,
+            owner_api_version=f"{self.group}/{self.version}",
+            owner_kind="BatchSandbox",
+            roll_back=lambda: self.k8s_client.delete_custom_object(
+                group=self.group,
+                version=self.version,
+                namespace=namespace,
+                plural=self.plural,
+                name=created["metadata"]["name"],
+                grace_period_seconds=0,
+            ),
+        )
 
         return {
             "name": created["metadata"]["name"],

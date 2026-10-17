@@ -550,7 +550,7 @@ copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
 # Both use only upstream symbols, so on upstream they compile and fail on behaviour.
 copy kubernetes/internal/utils/expectations/resource_version_expectation_wm20_test.go
 copy kubernetes/internal/controller/batchsandbox_status_stale_view_test.go
-# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21, WM-23.
+# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21, WM-23, WM-24, WM-25.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
 copy server/tests/test_runtime_resolver.py
@@ -570,6 +570,8 @@ copy server/tests/test_wm19_proxy_revalidation.py
 # constants). The helper unit tests in test_execd_access_token.py are not WM tests.
 copy server/tests/k8s/test_wm23_execd_token_behaviour.py
 copy server/tests/k8s/test_wm24_quota_refusal_behaviour.py
+# WM-25: the seed's Secret. Upstream has no seed, so it creates no Secret and fails there.
+copy server/tests/k8s/test_wm25_seed_secret_behaviour.py
 # WM-21: the credential proxy addon's own tests, run against upstream's system.py.
 copy components/egress/tests/test_mitmscripts_system.py
 

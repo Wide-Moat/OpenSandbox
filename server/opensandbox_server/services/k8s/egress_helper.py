@@ -31,6 +31,7 @@ from opensandbox_server.services.constants import (
     EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
     OTEL_EXPORTER_OTLP_ENDPOINT,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
+    OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED,
     OPENSANDBOX_EGRESS_ENFORCEMENT,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
@@ -38,11 +39,11 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
 )
-from opensandbox_server.services.helpers import (
-    credential_vault_seed_egress_env,
-    upstream_proxy_egress_env,
-)
+from opensandbox_server.services.helpers import upstream_proxy_egress_env
 from opensandbox_server.config import EGRESS_ENFORCEMENT_EXTERNAL
+from opensandbox_server.services.k8s.credential_vault_seed_secret import (
+    credential_vault_seed_env_entry,
+)
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 
 _IPV6_DISABLE_PATH = "/proc/sys/net/ipv6/conf/all/disable_ipv6"
@@ -147,10 +148,15 @@ def apply_egress_to_spec(
                 },
             }
         )
-    for name, value in credential_vault_seed_egress_env(
-        egress_settings.credential_vault_seed
-    ).items():
-        env.append({"name": name, "value": value})
+    if egress_settings.credential_vault_seed is not None:
+        # WM-25: a reference to the sandbox's seed Secret, never the value -- the pod and
+        # the workload are readable by anyone who may list them. The provider creates the
+        # Secret (credential_vault_seed_secret), named from the same sandbox id.
+        if not sandbox_id:
+            raise ValueError("sandbox_id is required to reference the credential vault seed Secret")
+        env.append(
+            credential_vault_seed_env_entry(OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_SEED, sandbox_id)
+        )
     if egress_settings.env:
         for name, value in egress_settings.env.items():
             if (
