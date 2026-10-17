@@ -26,6 +26,7 @@ a field it does not know. On a tree without WM-2 or WM-8 the tests therefore bui
 fail on the answer: the create is refused, or the pod lacks what it should carry.
 """
 
+import base64
 import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -153,7 +154,13 @@ async def test_wm8_seed_reaches_the_sidecar_through_create(
     body = await _create(k8s_service, provider, create_sandbox_request)
 
     sidecar, sandbox = _containers(body["spec"]["template"]["spec"])
-    sidecar_env = _env(sidecar)
+    sidecar_env = {e["name"]: e for e in sidecar.get("env", [])}
     assert _SEED_ENV in sidecar_env, f"the sidecar was not given the seed: {sorted(sidecar_env)}"
-    assert json.loads(sidecar_env[_SEED_ENV]) == seed
+    # WM-25: the sidecar reads it from the sandbox's own Secret, which create made.
+    ref = sidecar_env[_SEED_ENV].get("valueFrom", {}).get("secretKeyRef") or {}
+    created = [c.kwargs["body"] for c in mock_k8s_client.create_secret.call_args_list]
+    by_name = {s.metadata.name: s for s in created}
+    assert ref.get("name") in by_name, f"the seed Secret {ref} was not created: {sorted(by_name)}"
+    payload = by_name[ref["name"]].data[ref["key"]]
+    assert json.loads(base64.b64decode(payload)) == seed
     assert "s3cret-value" not in json.dumps(sandbox), "the sandbox container can read the credential"

@@ -2079,11 +2079,12 @@ components:
         the entries; the server checks the outer shape and the sidecar the
         entries. Requires `credentialProxy.enabled` and `networkPolicy`, and
         cannot be combined with `extensions.poolRef`. Delivered in the egress
-        sidecar's environment only; the sandbox container cannot read it. That
-        environment is a plain-text value in the sidecar's spec -- the Pod and
-        the BatchSandbox on Kubernetes, the container's configuration on
-        Docker -- so whoever can read those objects can read the seed, as they
-        can the sidecar's other credentials.
+        sidecar's environment only; the sandbox container cannot read it. On
+        Kubernetes that variable references a Secret of the sandbox's own,
+        owned by its workload and deleted with it, so the seed appears in
+        neither the Pod nor the workload's spec. On Docker it is a plain-text
+        value in the container's configuration, readable by whoever can
+        inspect the sidecar.
       required: [credentials, bindings]
       properties:
         credentials:
