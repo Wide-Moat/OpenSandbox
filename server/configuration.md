@@ -402,7 +402,7 @@ runtime.execd_run_as_init = false.`. The response carries
 | `home_volume_name`, `home_mount_path`, `home_storage`, `home_storage_class` | | `home`, `/home/user`, `10Gi`, none | The warm home claim. |
 | `egress_key_secret_name` | string | `opensandbox-warm-pool-egress-key` | The Secret (key `key`) the sidecars derive their tokens from; made by the server. |
 | `claim_prestart`, `claim_prestart_timeout_seconds` | list, int | `[]`, `5` | Hook execd runs at the claim, with the create's env. |
-| `claim_timeout_seconds` | float | `3.0` | Budget for one claim before going cold. |
+| `claim_timeout_seconds` | float | `3.0` | Budget for one claim before going cold. WM-33: no claim is made, and the create goes cold at once, when the Pool's `status.available` (ready, unallocated pods; each read has a 1 s request timeout and a 1.5 s overall bound, and a read that overlapped an allocation is taken once more, so this check adds at most about 3 s before the claim's own budget starts) less this server's claims not yet allocated is zero. It logs `warm pool <name>: cold create, no free pod (available=<n>, claims in flight=<m>)` -- no claim object exists for such a create, unlike `claim of no pod ... failed after ...: <cause>`, which is a claim that was made and failed before a pod was handed to it (out of budget, the pool reporting no ready pod, or an API error: the cause follows the colon). An unreadable Pool is asked as before. |
 | `reconcile_interval_seconds` | float | `60` | How often the Pool is compared with the rendering. |
 
 ## `[storage]`
