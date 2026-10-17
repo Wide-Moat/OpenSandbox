@@ -9,8 +9,8 @@ anything outside `NOTICE-WIDE-MOAT.md`, `hack/` and `.github/` must name its cha
 a `Wide-Moat-Change:` trailer, and no change may be named by two commits. A fix to a
 change is folded into that change's commit, not committed beside it.
 
-**Base:** `c7dc78a4090e5de2b9119e9bd93952cae24f87bd` (2026-10-01), marked by the
-`upstream-base` tag.
+**Base:** `531700ca18a7fa5fab6a2f25d6dc68a76eddab12`, upstream's `release-1.1.1` (2026-10-09),
+marked by the `upstream-base` tag.
 
 **Branches.** `main` is a pristine mirror of upstream's `main` and is never committed to;
 it exists so that a pull request against upstream is one click away. `wm` is this branch:
