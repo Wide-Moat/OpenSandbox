@@ -924,6 +924,16 @@ class WarmPoolConfig(BaseModel):
         description="Time to obtain and bind a warm pod before the create goes cold instead.",
     )
     reconcile_interval_seconds: float = Field(default=60.0, ge=5)
+    refill_max_starting: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "WM-35: at most this many pool pods starting (not yet Ready) at once, written as the "
+            "Pool's scaleStrategy.maxUnavailable. A refill competes for CPU with the claims that "
+            "emptied the pool; this paces it. Unset keeps the controller's default (25% of the "
+            "desired pods)."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> "WarmPoolConfig":

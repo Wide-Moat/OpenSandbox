@@ -289,6 +289,14 @@ def render_pool(provider: Any, app_config: AppConfig, execd_image: str) -> Dict[
             "recycleStrategy": {"type": "Delete"},
         },
     }
+    if cfg.refill_max_starting is not None:
+        # WM-35: the refill's pace. The controller starts at most this many pods that are not
+        # yet Ready; the rest wait for those to become Ready. Measured on prod (2026-10-18,
+        # room of 16 against a pool of 16): the controller started its default 8 at once the
+        # moment the claims emptied the pool, each a gVisor sandbox with its sidecar costing
+        # about 5-7 CPU-seconds to start, while the 16 claimed pods were mounting their trees
+        # and the opens were waiting on them; the node sat at 6-30 % idle.
+        manifest["spec"]["scaleStrategy"] = {"maxUnavailable": cfg.refill_max_starting}
     digest = _spec_digest(manifest["spec"])
     manifest["metadata"]["annotations"] = {TEMPLATE_HASH_ANNOTATION: digest}
     manifest["spec"]["template"]["metadata"]["labels"][WARM_TEMPLATE_LABEL] = digest[:40]
