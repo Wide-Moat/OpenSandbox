@@ -168,6 +168,9 @@ uncovered() { # "<change ids>" "<confirmed ids>" -> the uncovered ids, one per l
 is_guard() {
   case "$1" in
     TestWM1DialerStillSetsMarkByDefault) return 0 ;;
+    # WM-34: a taken address is still an error and nothing serves -- upstream's 200 ms wait
+    # caught it too.
+    TestWM34PolicyServerStillReportsATakenAddress) return 0 ;;
     TestWM1ReadyStillRequiresNftInSidecarMode) return 0 ;;
     TestWM1ReadyAcceptsDnsNftInSidecarMode) return 0 ;;
     TestWM1TransparentStaysTheDefault) return 0 ;;
@@ -604,6 +607,9 @@ copy server/tests/k8s/test_wm30_execd_answers_behaviour.py
 # WM-31: under external enforcement the export leaves the system store alone, with upstream
 # symbols only. Upstream adds the CA to the store first and fails there (unprivileged).
 copy components/egress/pkg/mitmproxy/system_trust_wm31_test.go
+# WM-34: the policy server's start, timed, with upstream symbols only (startPolicyServer and
+# stubProxy are upstream's). Upstream waits its fixed 200 ms and fails the 100 ms bound.
+copy components/egress/policy_server_listen_wm34_test.go
 # WM-21: the credential proxy addon's own tests, run against upstream's system.py.
 copy components/egress/tests/test_mitmscripts_system.py
 
