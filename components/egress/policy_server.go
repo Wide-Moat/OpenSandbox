@@ -155,15 +155,20 @@ func startPolicyServer(
 		}
 	})
 
-	errCh := make(chan error, 1)
-	safego.Go(func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	})
-
-	select {
-	case err := <-errCh:
+	// WM-34: THE SOCKET IS OPENED HERE, AND AN ERROR COMES BACK AT ONCE. This used to start
+	// ListenAndServe in a goroutine and wait a fixed 200 ms for it to fail -- every sidecar
+	// paid those 200 ms before mitmdump was even launched, and mitmdump is what the sandbox's
+	// bootstrap waits on (the CA is exported once it listens). Measured on the prod
+	// installation, 2026-10-18: "credential vault active API listening" at 25.325 s, "policy
+	// server listening" at 25.526 s, mitmdump started at 25.527 s, in a cold open of 4.95 s.
+	// net.Listen reports a bad or taken address synchronously, which is everything the wait
+	// could catch; an error while serving is logged as it was after the wait.
+	listenAddr := addr
+	if listenAddr == "" {
+		listenAddr = ":http" // what ListenAndServe uses for an empty Addr
+	}
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
 		if activeSrv != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			if cleanupErr := cleanupActiveSocket(shutdownCtx); cleanupErr != nil {
@@ -172,15 +177,14 @@ func startPolicyServer(
 			cancel()
 		}
 		return nil, nil, err
-	case <-time.After(200 * time.Millisecond):
-		handler.startAlwaysRuleReloadJob()
-		safego.Go(func() {
-			if err := <-errCh; err != nil {
-				log.Errorf("policy server error: %v", err)
-			}
-		})
-		return srv, handler, nil
 	}
+	safego.Go(func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Errorf("policy server error: %v", err)
+		}
+	})
+	handler.startAlwaysRuleReloadJob()
+	return srv, handler, nil
 }
 
 type policyServer struct {
