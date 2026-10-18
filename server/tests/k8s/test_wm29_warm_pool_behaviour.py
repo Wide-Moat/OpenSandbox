@@ -818,3 +818,38 @@ async def test_wm33_a_pool_read_that_hangs_is_asked_as_before_not_waited_on():
     assert took < 4, f"the create waited {took:.1f} s on the Pool read"
     assert len([b for b in env.created if b["spec"].get("poolRef")]) == 1, "the pool was not asked"
     assert response.extensions.get("opensandbox.extensions.warm-claimed") == "true"
+
+
+def _written_pool(config):
+    env = _Env()
+    missing = Exception("not found")
+    missing.status = 404
+    env.core.read_namespaced_secret.side_effect = missing
+    service = _service(config, env)
+    created = threading.Event()
+    env.custom.get_namespaced_custom_object.side_effect = _not_found
+    env.custom.create_namespaced_custom_object.side_effect = lambda *a, **k: created.set()
+    start = getattr(service, "start_warm_pool", None)
+    assert callable(start), "the server keeps no warm pool"
+    start()
+    try:
+        assert created.wait(5), "no Pool was written"
+    finally:
+        service._warm_pool.stop()
+    return env.custom.create_namespaced_custom_object.call_args.args[-1]
+
+
+def test_wm35_the_refill_is_paced_by_the_configured_number_of_starting_pods():
+    """refill_max_starting is written as the Pool's scaleStrategy.maxUnavailable: the
+    controller then starts at most that many pool pods that are not yet Ready."""
+    pool = _written_pool(_config(refill_max_starting=2))
+    assert pool["spec"].get("scaleStrategy") == {"maxUnavailable": 2}
+
+
+def test_wm35_unset_leaves_the_controllers_default_pace():
+    """Without the key the Pool carries no scaleStrategy, so the controller's own default
+    (25 % of the desired pods) applies, as before WM-35."""
+    pool = _written_pool(_config())
+    assert "scaleStrategy" not in pool["spec"]
+    assert pool["spec"]["capacitySpec"]["bufferMax"] == 3
+
