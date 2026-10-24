@@ -67,6 +67,7 @@ The following table lists the configurable parameters of the chart and their def
 |-----|------|---------|-------------|
 | controller.affinity | object | `{}` | Affinity for controller pod assignment |
 | controller.containerSecurityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":false}` | Container security context |
+| controller.endedSandboxGrace | string | `""` | Optional terminal sandbox cleanup grace (for example "10m"). Empty disables it. Requires leader election; homes remain under independent volume retention. |
 | controller.image | object | `{"pullPolicy":"IfNotPresent","repository":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/controller","tag":""}` | Controller image configuration |
 | controller.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy |
 | controller.image.repository | string | `"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/controller"` | Controller image repository |
