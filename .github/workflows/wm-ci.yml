@@ -143,6 +143,10 @@ jobs:
       # The gates' own classifiers, against inputs whose answer is known, before the gate
       # that relies on them.
       - run: hack/wm-gates-selftest.sh
+      - name: Prepare real API assets for controller behavior proof
+        run: |
+          make -C kubernetes setup-envtest
+          echo "KUBEBUILDER_ASSETS=$(pwd)/$(find kubernetes/bin/k8s -mindepth 1 -maxdepth 1 -type d | head -1)" >> "$GITHUB_ENV"
       - run: hack/wm-fail-on-base.sh
 
   images:
