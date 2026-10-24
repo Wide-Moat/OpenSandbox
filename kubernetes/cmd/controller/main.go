@@ -479,14 +479,15 @@ func main() {
 	}
 
 	if err := (&controller.BatchSandboxReconciler{
-		Client:              mgr.GetClient(),
-		Scheme:              mgr.GetScheme(),
-		Recorder:            mgr.GetEventRecorderFor("batchsandbox-controller"),
-		ResumePullSecret:    resumePullSecret,
-		SnapshotRegistry:    snapshotRegistry,
-		ProfileStore:        profileStore,
-		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
-		FeatureConfig:       featureConfig,
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		Recorder:              mgr.GetEventRecorderFor("batchsandbox-controller"),
+		ResumePullSecret:      resumePullSecret,
+		SnapshotRegistry:      snapshotRegistry,
+		ProfileStore:          profileStore,
+		StatusRVExpectation:   expectations.NewResourceVersionExpectation(),
+		FeatureConfig:         featureConfig,
+		LeaderElectionEnabled: enableLeaderElection,
 	}).SetupWithManager(mgr, batchSandboxConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BatchSandbox")
 		os.Exit(1)
