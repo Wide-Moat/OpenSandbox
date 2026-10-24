@@ -575,6 +575,7 @@ copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
 # Both use only upstream symbols, so on upstream they compile and fail on behaviour.
 copy kubernetes/internal/utils/expectations/resource_version_expectation_wm20_test.go
 copy kubernetes/internal/controller/batchsandbox_status_stale_view_test.go
+copy kubernetes/internal/controller/ended_cleanup_wm22_test.go
 # Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21, WM-23, WM-24, WM-25, WM-29, WM-30.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
