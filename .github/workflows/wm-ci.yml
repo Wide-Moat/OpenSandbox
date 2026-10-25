@@ -48,6 +48,17 @@ env:
   UPSTREAM_BASE: ${{ inputs.upstream_base || 'upstream-base' }}
 
 jobs:
+  session-create-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate offline performance evidence logic
+        run: |
+          node --version
+          node --check test/perf/session-create.js
+          node --test test/perf/evaluate.test.mjs
+
   # The three sets that describe this fork's changes must agree. A rebase that silently
   # dropped one is the failure; see hack/wm-check.sh.
   changes-are-accounted-for:
