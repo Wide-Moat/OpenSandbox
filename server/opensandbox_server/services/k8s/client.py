@@ -479,19 +479,41 @@ class K8sClient:
         self,
         namespace: str,
         name: str,
+        uid: Optional[str] = None,
+        resource_version: Optional[str] = None,
     ) -> None:
-        """Delete a PersistentVolumeClaim by name. 404 is swallowed."""
+        """Delete a PersistentVolumeClaim by name. 404 is swallowed.
+
+        With ``uid`` and/or ``resource_version``, only that object as it was read: the API
+        server refuses (409) a claim of the same name made again since, or one changed since,
+        so a caller deleting what it created cannot reach what someone else made or took.
+        """
         if self._write_limiter:
             self._write_limiter.acquire()
+        extra: Dict[str, Any] = {}
+        if uid or resource_version:
+            extra["body"] = client.V1DeleteOptions(
+                preconditions=client.V1Preconditions(uid=uid, resource_version=resource_version)
+            )
         try:
             self.get_core_v1_api().delete_namespaced_persistent_volume_claim(
                 name=name,
                 namespace=namespace,
+                **extra,
             )
         except ApiException as e:
             if e.status == 404:
                 return
             raise
+
+    def patch_pvc_json(self, namespace: str, name: str, ops: List[Dict[str, Any]]) -> Any:
+        """Apply a JSON patch (RFC 6902) to a PersistentVolumeClaim -- with ``test`` operations,
+        a write that happens only if the object still holds what the caller read."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        return self.get_core_v1_api().patch_namespaced_persistent_volume_claim(
+            name=name, namespace=namespace, body=ops
+        )
 
     def patch_pvc(
         self,

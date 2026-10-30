@@ -250,6 +250,11 @@ is_guard() {
     # WM-32 asks execd only once the pod has an address: a Pending BatchSandbox without one
     # is waited on, unasked, exactly as upstream waits on it.
     test_wm32_a_pending_batchsandbox_without_an_address_is_not_asked) return 0 ;;
+    # WM-36 deletes only the claim a failed create made itself. A claim that existed before the
+    # create, and a new one another create has taken, are kept -- as upstream keeps every
+    # persistent claim; without these the rollback could delete any claim the create named.
+    test_wm36_a_home_that_existed_before_the_create_is_kept) return 0 ;;
+    test_wm36_a_new_home_another_create_has_taken_is_kept) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -575,7 +580,7 @@ copy kubernetes/internal/controller/batchsandbox_pause_preflight_test.go
 # Both use only upstream symbols, so on upstream they compile and fail on behaviour.
 copy kubernetes/internal/utils/expectations/resource_version_expectation_wm20_test.go
 copy kubernetes/internal/controller/batchsandbox_status_stale_view_test.go
-# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21, WM-23, WM-24, WM-25, WM-29, WM-30.
+# Python: WM-2, WM-4, WM-8, WM-10, WM-11, WM-13, WM-14, WM-15, WM-16, WM-18, WM-19, WM-21, WM-23, WM-24, WM-25, WM-29, WM-30, WM-36.
 copy server/tests/test_validators.py
 copy server/tests/test_config.py
 copy server/tests/test_runtime_resolver.py
@@ -604,6 +609,10 @@ copy server/tests/k8s/test_wm29_warm_pool_behaviour.py
 # WM-32 (same file): a Pending BatchSandbox with an address is asked too; upstream waits for the
 # phase to move and ends in the test's 504.
 copy server/tests/k8s/test_wm30_execd_answers_behaviour.py
+# WM-36: a failed create's own persistent claim, through create_sandbox and the client methods
+# upstream has (patch_pvc_json is a MagicMock attribute there). Upstream deletes nothing, marks
+# nothing and mounts a Terminating claim, so it fails on what is deleted, patched and answered.
+copy server/tests/k8s/test_wm36_failed_create_home_behaviour.py
 # WM-31: under external enforcement the export leaves the system store alone, with upstream
 # symbols only. Upstream adds the CA to the store first and fails there (unprivileged).
 copy components/egress/pkg/mitmproxy/system_trust_wm31_test.go

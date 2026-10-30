@@ -218,7 +218,7 @@ sandbox = await Sandbox.create(
 ```
 
 ::: tip Cleanup scope
-The server only deletes PVCs it provisioned with this opt-in. Pre-existing PVCs and PVCs provisioned with `deleteOnSandboxTermination=false` are never touched. An opted-in PVC is exclusively owned by the sandbox that created it — a second sandbox attempting to mount the same `claimName` is rejected with `409 CONFLICT`. Use unique `claimName`s per sandbox, or use a non-opted-in / pre-existing PVC if you need to share storage.
+The server only deletes PVCs it provisioned with this opt-in. Pre-existing PVCs and PVCs provisioned with `deleteOnSandboxTermination=false` are never touched, except that a create which fails removes the PVC it provisioned itself (see [A create that fails](#a-create-that-fails)). An opted-in PVC is exclusively owned by the sandbox that created it — a second sandbox attempting to mount the same `claimName` is rejected with `409 CONFLICT`. Use unique `claimName`s per sandbox, or use a non-opted-in / pre-existing PVC if you need to share storage.
 :::
 
 ## PVC lifecycle
@@ -237,6 +237,12 @@ For opted-in PVCs, the server labels them with `opensandbox.io/volume-managed-by
 2. **Label-selector sweep** -- on `DELETE /sandboxes/{id}`, the server lists PVCs by those labels and deletes them best-effort. This catches cases where the `ownerReferences` patch failed (e.g. RBAC) and ensures the PVC is gone as soon as the API returns.
 
 Both paths only match server-labeled PVCs, so BYO and opted-out claims are never reclaimed. The underlying PV follows its `StorageClass.reclaimPolicy` once the PVC is deleted.
+
+### A create that fails
+
+A create that returns an error returns no sandbox id, so nothing it made can be cleaned up through the API afterwards. The server therefore rolls back what it made itself: an opted-in PVC through the label sweep above, and -- on Kubernetes -- an opted-out (`deleteOnSandboxTermination=false`) PVC **that this same create provisioned**, deleted once the workload is gone. Such a PVC carries the annotation `opensandbox.io/provisional-for: <sandbox id>` until its create succeeds; any other create that mounts it removes that annotation first, and the rollback deletes only a PVC that still carries its own id, held to the uid and `resourceVersion` it read -- so a PVC another create has taken in the meantime is kept. A PVC that existed before the create is never touched. A create that finds its `createIfNotExists` claim still being deleted (for example, the retry right after a failed create) waits up to 30 seconds for it to go and provisions it again, rather than mounting a claim no pod can start with. If the claim is still there after 30 seconds, the create fails with `503` and code `KUBERNETES::API_ERROR` (`PVC '<claimName>' is still being deleted after 30s; retry the request.`); retry it. A create that mounts a PVC whose creator is rolling it back at that moment fails the same way (`PVC '<claimName>' is being provisioned or rolled back by another create; retry the request.`).
+
+The rollback is best-effort. A PVC is left in place, for the operator or a reaper, when the workload's deletion could not be confirmed, when the server could not read or delete the PVC, or when the server stopped before the rollback ran.
 
 ## Important notes
 
