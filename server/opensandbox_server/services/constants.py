@@ -24,6 +24,10 @@ SANDBOX_TENANT_LABEL = "opensandbox.io/tenant"
 # An annotation, not a label: a subject is opaque and need not be label-safe, and
 # authorization compares it exactly.
 SANDBOX_OWNER_SUBJECT_ANNOTATION = "opensandbox.io/owner-subject"
+# WM-36: on a persistent PVC a create made, the id of that create until it succeeds. A failed
+# create deletes the claim only while it still says so; any other create that mounts the claim
+# removes it first, which is what makes the claim no longer the failed create's to delete.
+SANDBOX_PROVISIONAL_HOME_ANNOTATION = "opensandbox.io/provisional-for"
 SANDBOX_EXPIRES_AT_LABEL = "opensandbox.io/expires-at"
 SANDBOX_MANUAL_CLEANUP_LABEL = "opensandbox.io/manual-cleanup"
 SANDBOX_PLATFORM_OS_LABEL = "opensandbox.io/platform-os"

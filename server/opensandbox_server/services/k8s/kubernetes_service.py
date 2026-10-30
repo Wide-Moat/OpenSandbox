@@ -58,6 +58,7 @@ from opensandbox_server.services.constants import (
     SANDBOX_ID_LABEL,
     SANDBOX_MANAGED_VOLUMES_LABEL,
     SANDBOX_OWNER_SUBJECT_ANNOTATION,
+    SANDBOX_PROVISIONAL_HOME_ANNOTATION,
     SANDBOX_TENANT_LABEL,
     SandboxErrorCodes,
 )
@@ -139,6 +140,18 @@ logger = logging.getLogger(__name__)
 # permission; that is a deployment property no retry fixes within a window
 # this short, so back off flat (not exponential) and say so once per window.
 _CLUSTER_LOOKUP_FORBIDDEN_BACKOFF_SECONDS = 600.0
+
+# WM-36: how long a create waits for a claim it would mount to finish being deleted, and how
+# often it looks. The claim goes once the last pod using it is gone, which for a sandbox whose
+# create just failed is that pod's termination -- seconds.
+_TERMINATING_PVC_WAIT_SECONDS = 30.0
+_TERMINATING_PVC_POLL_SECONDS = 0.2
+
+
+def _is_terminating(obj: Any) -> bool:
+    """True when the object carries a deletionTimestamp (the client gives a datetime)."""
+    stamp = getattr(getattr(obj, "metadata", None), "deletion_timestamp", None)
+    return isinstance(stamp, (datetime, str)) and bool(stamp)
 
 
 def _is_namespace_not_found(exc: Exception) -> bool:
@@ -855,7 +868,12 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 },
             )
 
-    def _ensure_pvc_volumes(self, volumes: list, sandbox_id: str) -> list[str]:
+    def _ensure_pvc_volumes(
+        self,
+        volumes: list,
+        sandbox_id: str,
+        created_homes: Optional[list[tuple[str, str]]] = None,
+    ) -> list[str]:
         """
         Ensure that PVC volumes exist before creating the workload.
 
@@ -874,6 +892,18 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         controller-driven CR deletion (TTL expiry, cascade delete) also
         garbage-collects the PVC. PVCs that were already present, opt-out
         PVCs, and PVCs we failed to create are excluded from the list.
+
+        WM-36: ``created_homes``, when given, receives ``(name, uid)`` of every
+        persistent (opt-out) PVC this call created. Such a claim is meant to
+        outlive its sandboxes, so nothing deletes it with one -- but a claim the
+        create itself made, for a sandbox that then never became ready, holds
+        nothing of anyone, and the create returns no id it could later be found
+        by. ``create_sandbox`` deletes exactly those, by uid, when it fails --
+        while they still carry its ``provisional-for`` annotation, which any
+        other create mounting the claim removes first (_adopt_provisional_claim). A
+        ``createIfNotExists`` claim found still being deleted (the claim such a
+        rollback just deleted, while its pod goes) is waited out and made again:
+        no pod can start on a claim being deleted.
 
         Fails closed when the service account cannot read PVCs (403 on
         ``get``): the ownership pre-pass cannot run, and silently mounting a
@@ -969,6 +999,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 vol.pvc.claim_name = claim_name
                 existing = aliased
                 resolved_aliases.add(claim_name)
+            elif existing is not None and vol.pvc.create_if_not_exists and _is_terminating(existing):
+                # WM-36: after the alias, which wins over a claim that has the name itself.
+                existing = self._wait_for_pvc_gone(claim_name)
             if (
                 existing is not None
                 and ((getattr(existing.metadata, "labels", None) or {}).get(warm_pool.WARM_POOL_HOME_LABEL))
@@ -982,6 +1015,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             existing_cache[claim_name] = existing
             if existing is not None:
                 self._reject_pvc_owned_by_other_sandbox(existing, claim_name, sandbox_id)
+                self._adopt_provisional_claim(existing, claim_name, sandbox_id)
 
         managed_pvcs: list[str] = []
         seen_claims: set[str] = set()
@@ -1005,16 +1039,21 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
 
             is_managed = bool(vol.pvc.delete_on_sandbox_termination)
             pvc_labels: dict[str, str] = {}
+            pvc_annotations: dict[str, str] = {}
+            if subject is not None:
+                pvc_annotations[SANDBOX_OWNER_SUBJECT_ANNOTATION] = subject
             if is_managed:
                 pvc_labels[SANDBOX_MANAGED_VOLUMES_LABEL] = "server"
                 pvc_labels[SANDBOX_ID_LABEL] = sandbox_id
+            elif created_homes is not None:
+                pvc_annotations[SANDBOX_PROVISIONAL_HOME_ANNOTATION] = sandbox_id
 
             pvc_body = V1PersistentVolumeClaim(
                 metadata=V1ObjectMeta(
                     name=claim_name,
                     namespace=self._resolve_namespace(),
                     labels=pvc_labels or None,
-                    annotations={SANDBOX_OWNER_SUBJECT_ANNOTATION: subject} if subject is not None else None,
+                    annotations=pvc_annotations or None,
                 ),
                 spec={
                     "accessModes": access_modes,
@@ -1025,13 +1064,19 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 pvc_body.spec["storageClassName"] = storage_class
 
             try:
-                self.k8s_client.create_pvc(self._resolve_namespace(), pvc_body)
+                created = self.k8s_client.create_pvc(self._resolve_namespace(), pvc_body)
                 logger.info(
                     f"Auto-created PVC '{claim_name}' (size={storage}, class={storage_class or '<default>'}) "
                     f"in namespace '{self._resolve_namespace()}'"
                 )
                 if is_managed:
                     managed_pvcs.append(claim_name)
+                elif created_homes is not None:
+                    created_uid = getattr(getattr(created, "metadata", None), "uid", None)
+                    if isinstance(created_uid, str) and created_uid:
+                        # Without a uid the delete could not be held to this object; such a
+                        # claim is left to the installation's reaper, as before.
+                        created_homes.append((claim_name, created_uid))
             except ApiException as e:
                 if e.status == 409:
                     # Race: another request created the PVC between our
@@ -1079,6 +1124,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                             },
                         )
                     self._reject_pvc_owned_by_other_sandbox(racer, claim_name, sandbox_id)
+                    # WM-36: the winner may yet fail and roll its claim back; take it first.
+                    self._adopt_provisional_claim(racer, claim_name, sandbox_id)
                     # Don't add to managed_pvcs — whoever created it owns it.
                     logger.info(f"PVC '{claim_name}' was created concurrently, proceeding")
                 elif e.status == 403:
@@ -1593,6 +1640,8 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         # deleted (or already gone).
         workload_left_alive = False
         created_managed_pvcs: list[str] = []
+        # WM-36: persistent claims this create made, deleted with it if it fails.
+        created_homes: list[tuple[str, str]] = []
         try:
             context = _build_create_workload_context(
                 app_config=self.app_config,
@@ -1647,7 +1696,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             if request.volumes:
                 managed_pvcs_may_exist = True
                 created_managed_pvcs = await asyncio.to_thread(
-                    self._ensure_pvc_volumes, request.volumes, sandbox_id
+                    self._ensure_pvc_volumes, request.volumes, sandbox_id, created_homes
                 )
 
             # Create the workload CR. Three failure modes drive PVC cleanup:
@@ -1782,6 +1831,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 # and any PVCs we created. delete_sandbox is responsible for
                 # the eventual cleanup.
                 managed_pvcs_may_exist = False
+                await asyncio.to_thread(self._release_provisional_claims, created_homes, sandbox_id)
                 workload_left_alive = False
                 return response
 
@@ -1861,6 +1911,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     # otherwise stall the event loop when the API server is
                     # slow or several PVCs need sweeping.
                     await asyncio.to_thread(self._cleanup_managed_pvcs, sandbox_id)
+                    await asyncio.to_thread(self._delete_created_homes, created_homes, sandbox_id)
 
     def get_sandbox(self, sandbox_id: str) -> Sandbox:
         try:
@@ -2004,7 +2055,133 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 logger.warning(
                     f"sandbox={sandbox_id} | failed to delete managed PVC '{name}': {e}"
                 )
-    
+
+    def _wait_for_pvc_gone(self, claim_name: str) -> Any:
+        """WM-36: wait for a claim being deleted to be gone, and answer None; or answer the
+        claim that replaced it, if one was made meanwhile. Still there when the wait is over is
+        a 503 to retry: mounting it would only time out, since no pod starts on such a claim."""
+        namespace = self._resolve_namespace()
+        deadline = time.monotonic() + _TERMINATING_PVC_WAIT_SECONDS
+        logger.info(f"PVC '{claim_name}' is being deleted; waiting for it to go before making it again")
+        while True:
+            current = self.k8s_client.get_pvc(namespace, claim_name)
+            if current is None or not _is_terminating(current):
+                return current
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": SandboxErrorCodes.K8S_API_ERROR,
+                        "message": (
+                            f"PVC '{claim_name}' is still being deleted after "
+                            f"{_TERMINATING_PVC_WAIT_SECONDS:.0f}s; retry the request."
+                        ),
+                    },
+                )
+            time.sleep(_TERMINATING_PVC_POLL_SECONDS)
+
+    def _provisional_ops(self, sandbox_id: str, resource_version: Any = None) -> list[dict[str, Any]]:
+        path = "/metadata/annotations/" + SANDBOX_PROVISIONAL_HOME_ANNOTATION.replace("~", "~0").replace("/", "~1")
+        ops: list[dict[str, Any]] = []
+        if isinstance(resource_version, str) and resource_version:
+            # Unchanged since it was read -- above all, not since deleted: a claim a finalizer
+            # holds after its DELETE is still patchable, and its annotation still there.
+            ops.append({"op": "test", "path": "/metadata/resourceVersion", "value": resource_version})
+        return ops + [{"op": "test", "path": path, "value": sandbox_id}, {"op": "remove", "path": path}]
+
+    def _adopt_provisional_claim(self, existing: Any, claim_name: str, sandbox_id: str) -> None:
+        """WM-36: a claim another create made and has not yet succeeded with is taken from it
+        before this create mounts it, so that create's rollback no longer deletes it.
+
+        The removal tests the value it removes, and the rollback deletes at the
+        resourceVersion it read: whichever lands second is refused, so a claim is never both
+        mounted here and deleted there. A claim already gone or being deleted (the rollback
+        won) is a 503 to retry, which then makes it again.
+        """
+        annotations = getattr(getattr(existing, "metadata", None), "annotations", None) or {}
+        creator = annotations.get(SANDBOX_PROVISIONAL_HOME_ANNOTATION)
+        if not isinstance(creator, str) or not creator or creator == sandbox_id:
+            return
+        namespace = self._resolve_namespace()
+        patch_error: Optional[Exception] = None
+        if _is_terminating(existing):
+            current = existing
+        else:
+            try:
+                self.k8s_client.patch_pvc_json(
+                    namespace,
+                    claim_name,
+                    self._provisional_ops(creator, getattr(existing.metadata, "resource_version", None)),
+                )
+                return
+            except Exception as e:  # noqa: BLE001 - decided below from what the claim is now
+                patch_error = e
+            current = self.k8s_client.get_pvc(namespace, claim_name)
+        current_annotations = getattr(getattr(current, "metadata", None), "annotations", None) or {}
+        if (
+            current is not None
+            and not _is_terminating(current)
+            and getattr(current.metadata, "uid", None) == getattr(existing.metadata, "uid", None)
+            and SANDBOX_PROVISIONAL_HOME_ANNOTATION not in current_annotations
+        ):
+            return  # another create took it first, or its creator succeeded: no longer deletable
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": SandboxErrorCodes.K8S_API_ERROR,
+                "message": (
+                    f"PVC '{claim_name}' is being provisioned or rolled back by another create; "
+                    f"retry the request."
+                ),
+            },
+        ) from patch_error
+
+    def _release_provisional_claims(self, homes: list[tuple[str, str]], sandbox_id: str) -> None:
+        """WM-36: the create succeeded; the claims it made are ordinary persistent claims now.
+        Best-effort: a marker left behind is removed by the next create that mounts the claim,
+        and only this sandbox's own failed create would ever act on it."""
+        namespace = self._resolve_namespace()
+        for name, _uid in homes:
+            try:
+                self.k8s_client.patch_pvc_json(namespace, name, self._provisional_ops(sandbox_id))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"sandbox={sandbox_id} | could not clear the provisional mark on PVC '{name}': {e}")
+
+    def _delete_created_homes(self, homes: list[tuple[str, str]], sandbox_id: str) -> None:
+        """WM-36: delete the persistent claims a failed create made, once its workload is gone.
+
+        Only what this create made and nobody has taken since: the claim must still have the
+        uid it was created with and still carry this create's ``provisional-for`` annotation,
+        which every other create mounting it removes first (_adopt_provisional_claim). The
+        delete is held to the uid and resourceVersion just read, so a claim taken between the
+        read and the delete is refused by the API server rather than deleted. A claim that
+        cannot be read or deleted is left, as before this, to the installation's reaper.
+        Best-effort; never raises.
+        """
+        namespace = self._resolve_namespace()
+        for name, uid in homes:
+            try:
+                current = self.k8s_client.get_pvc(namespace, name)
+                meta = getattr(current, "metadata", None)
+                annotations = getattr(meta, "annotations", None) or {}
+                if current is None or getattr(meta, "uid", None) != uid:
+                    continue
+                if annotations.get(SANDBOX_PROVISIONAL_HOME_ANNOTATION) != sandbox_id:
+                    logger.info(
+                        f"sandbox={sandbox_id} | not deleting PVC '{name}' this failed create made: "
+                        f"another create has taken it"
+                    )
+                    continue
+                version = getattr(meta, "resource_version", None)
+                self.k8s_client.delete_pvc(
+                    namespace, name, uid=uid, resource_version=version if isinstance(version, str) else None
+                )
+                logger.info(f"sandbox={sandbox_id} | deleted PVC '{name}' made by this failed create")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"sandbox={sandbox_id} | could not delete PVC '{name}' made by this failed create: {e}"
+                )
+
     def pause_sandbox(self, sandbox_id: str) -> None:
         try:
             ns = self._resolve_namespace()

@@ -248,6 +248,39 @@ class TestK8sClient:
 
         fake_informer.invalidate.assert_not_called()
 
+    def test_delete_pvc_without_preconditions_sends_no_body(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        c.delete_pvc("ns", "claim")
+        c._core_v1_api.delete_namespaced_persistent_volume_claim.assert_called_once_with(
+            name="claim", namespace="ns"
+        )
+
+    def test_delete_pvc_holds_the_delete_to_uid_and_resource_version(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        c.delete_pvc("ns", "claim", uid="u-1", resource_version="42")
+        kwargs = c._core_v1_api.delete_namespaced_persistent_volume_claim.call_args.kwargs
+        assert kwargs["body"].preconditions.uid == "u-1"
+        assert kwargs["body"].preconditions.resource_version == "42"
+
+    def test_delete_pvc_propagates_a_refused_precondition(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        c._core_v1_api.delete_namespaced_persistent_volume_claim.side_effect = ApiException(status=409)
+        with pytest.raises(ApiException):
+            c.delete_pvc("ns", "claim", uid="u-1")
+
+    def test_delete_pvc_swallows_404(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        c._core_v1_api.delete_namespaced_persistent_volume_claim.side_effect = ApiException(status=404)
+        c.delete_pvc("ns", "claim", uid="u-1")
+
+    def test_patch_pvc_json_sends_the_operations_as_a_list(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        ops = [{"op": "remove", "path": "/metadata/annotations/a"}]
+        c.patch_pvc_json("ns", "claim", ops)
+        c._core_v1_api.patch_namespaced_persistent_volume_claim.assert_called_once_with(
+            name="claim", namespace="ns", body=ops
+        )
+
     def test_get_custom_object_returns_none_on_404(self, k8s_runtime_config):
         c = self._make_client(k8s_runtime_config)
         c._custom_objects_api.get_namespaced_custom_object.side_effect = ApiException(status=404)
