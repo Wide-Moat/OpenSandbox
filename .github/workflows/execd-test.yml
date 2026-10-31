@@ -199,6 +199,18 @@ jobs:
           # kernel; the self-hosted leg is the 5.10 empirical validation
           # (inline-filename exec-hook fallback). Host prerequisites (BTF,
           # cgroup v2, tracefs) are prechecked by the script.
+          #
+          # When the runner's kernel has no tracefs events at all, the smoke cannot
+          # run, and that is the runner and not the code under test: measured on
+          # 2026-10-30, where /sys/kernel/tracing was already mounted and held no
+          # events/, on a runner where the same job had passed on 2026-10-18. That
+          # case is a visible warning and a skip, so the images this fork builds are
+          # not held back by a runner image change; any other failure of the script
+          # still fails the step.
+          if [ ! -e /sys/kernel/tracing/events ] && [ ! -e /sys/kernel/debug/tracing/events ]; then
+            echo "::warning title=execd eBPF smoke skipped::this runner's kernel exposes no tracefs events dir, so the eBPF smoke cannot run here"
+            exit 0
+          fi
           bash scripts/execd-ebpf-smoke.sh --build
 
       - name: Show logs
