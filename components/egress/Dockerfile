@@ -78,7 +78,10 @@ RUN cd /workspace/components/internal && \
 FROM debian:bookworm-slim
 
 # iptables is needed for DNS REDIRECT; ca-certificates for TLS to upstream resolvers
+# Wide Moat: upgrade first -- the base snapshot ships libbrotli1 1.0.9-2+b6, which has a
+# CRITICAL advisory fixed in 1.0.9-2+deb12u1 (WID-361).
 RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         iptables \
         iproute2 \
@@ -109,6 +112,22 @@ RUN useradd -r -u 10042 -d /var/lib/mitmproxy -s /usr/sbin/nologin mitmproxy \
     && mkdir -p /var/lib/mitmproxy/.mitmproxy \
     && chown -R mitmproxy:mitmproxy /var/lib/mitmproxy \
     && pip3 install --no-cache-dir --break-system-packages 'mitmproxy==11.0.2' \
+    # Wide Moat (WID-361): mitmproxy 11.0.2 declares Brotli<=1.1.0, and Brotli 1.1.0 and the
+    # certifi pip resolves at build time carry CRITICAL advisories with fixes (Brotli 1.2.1,
+    # certifi 2026.10.18). Every mitmproxy release that allows Brotli 1.2.1 needs Python
+    # >=3.12, which bookworm (3.11) does not have, so the pin is overridden rather than
+    # followed: --no-deps, because pip would otherwise refuse the conflict. mitmproxy only
+    # calls brotli.compress/decompress, which 1.2.1 keeps. The check below fails the build
+    # if either floor is missing or content decoding through mitmproxy stops working: each
+    # direction is checked against the other library, since mitmproxy caches its last
+    # encode/decode pair and a round-trip through it alone could skip decompress.
+    && pip3 install --no-cache-dir --break-system-packages --no-deps 'Brotli==1.2.1' 'certifi>=2026.10.18' \
+    && python3 -c "import importlib.metadata as m; from mitmproxy.net import encoding; \
+assert m.version('brotli') == '1.2.1', m.version('brotli'); \
+assert tuple(map(int, m.version('certifi').split('.'))) >= (2026, 10, 18), m.version('certifi'); \
+import brotli; raw = brotli.compress(b'y' * 1000); assert encoding.decode(raw, 'br') == b'y' * 1000; \
+d = encoding.encode(b'x' * 1000, 'br'); assert brotli.decompress(d) == b'x' * 1000; \
+print('brotli', m.version('brotli'), 'certifi', m.version('certifi'), 'mitmproxy', m.version('mitmproxy'))" \
     && (command -v mitmdump && mitmdump --version) \
     && mkdir -p /var/egress/mitmscripts
 
