@@ -1920,21 +1920,31 @@ async def test_stream_authorization_timeout_is_bounded(monkeypatch):
     original = TenantEntry(name='owner', namespace='stage', subject='owner')
     set_current_tenant(original)
     release = threading.Event()
+    started = threading.Event()
     ended = threading.Event()
     def refresh(key):
+        started.set()
         try:
-            release.wait(2)
+            release.wait(5)
             return original
         finally:
             ended.set()
     connection = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
         tenant_provider=SimpleNamespace(lookup_fresh=refresh))), headers={SANDBOX_API_KEY_HEADER: 'synthetic'})
-    monkeypatch.setattr(proxy_api, '_PROXY_AUTH_TIMEOUT_SECONDS', 0.01)
+    # Long enough for anyio's worker to pick the call up: a call cancelled before a worker
+    # dequeues it is never run at all (anyio WorkerThread.run skips a cancelled future), and
+    # at 0.01 s that happened on the Windows runner, where the timer ticks every ~15 ms --
+    # the refresh never started, so it never ended. 0.2 s keeps the bound under test far
+    # below the 5 s the refresh would block for.
+    monkeypatch.setattr(proxy_api, '_PROXY_AUTH_TIMEOUT_SECONDS', 0.2)
     try:
-        assert not await asyncio.wait_for(proxy_api._ProxyAuthorization(connection).valid(), timeout=0.5)
+        assert not await asyncio.wait_for(proxy_api._ProxyAuthorization(connection).valid(), timeout=2)
+        # The timeout cut off a refresh that was running, not one that never began.
+        assert started.is_set()
+        assert not ended.is_set()
     finally:
         release.set()
-        await asyncio.to_thread(ended.wait, 1)
+        await asyncio.to_thread(ended.wait, 2)
     assert ended.is_set()
 
 
