@@ -191,7 +191,31 @@ expect_answers() {
   echo "${out}" | grep -q "answers=$3" || fail "dns ${2}: expected answer $3, got '${out}'"
 }
 
-nft_has() { nft list table inet opensandbox-fast-sandbox 2>/dev/null | grep -q "$1"; }
+# nft_table_flat: the fast-sandbox nft table flattened to single-spaced tokens,
+# so line wrapping or spacing changes in nft's rendering cannot false-fail a
+# grep. An nft error is printed and returned, never silently empty: a broken
+# nft or runner reads as an error, not as "rule missing" (#2541).
+nft_table_flat() {
+  local out
+  if ! out="$(nft list table inet opensandbox-fast-sandbox 2>&1)"; then
+    echo "nft list table inet opensandbox-fast-sandbox failed:" >&2
+    printf '%s\n' "${out}" >&2
+    return 1
+  fi
+  printf '%s\n' "${out}" | tr '\n' '\t' | tr -s ' \t' ' '
+}
+
+nft_has() { nft_table_flat | grep -q "$1"; }
+
+nft_has_set() {
+  local out
+  if ! out="$(nft list set inet opensandbox-fast-sandbox "$1" 2>&1)"; then
+    echo "nft list set inet opensandbox-fast-sandbox $1 failed:" >&2
+    printf '%s\n' "${out}" >&2
+    return 1
+  fi
+  printf '%s\n' "${out}" | tr '\n' '\t' | tr -s ' \t' ' ' | grep -q "$2"
+}
 
 # subject_state <uid>: prints the subject's lifecycle state from GET /policy.
 subject_state() {
@@ -331,8 +355,8 @@ pass "DoH-443 blocking installed (doh_block_v4 set + element + drop rule)"
 info "Test 1: SET_BINDING registers deny-first (fail closed before any policy)"
 set_binding a 10.10.0.5 1 runtime-a att-a '{"defaultAction":"deny"}'
 wait_for 15 "subject a deny-first installed" nft_has 'subj_s_a'
-nft_has 'ip saddr 10.10.0.5 jump subj_s_a' || fail "dispatch rule missing"
-nft_has 'subj_s_a_allow_v4 {' || fail "subject a static sets missing"
+wait_for 10 "subject a dispatch rule" nft_has 'ip saddr 10.10.0.5 jump subj_s_a'
+wait_for 10 "subject a static sets" nft_has 'subj_s_a_allow_v4 {'
 expect_rcode osb-sandbox-a allow.test 3
 pass "deny-first registered (nft + NXDOMAIN, policy pending)"
 
@@ -346,7 +370,7 @@ expect_answers osb-sandbox-a other.test 1.1.1.2
 expect_rcode osb-sandbox-a nope.test 3
 pass "DNS per-subject policy (allow *.test, deny others)"
 
-nft_has '10.99.0.2' || fail "static allow element missing from nft"
+wait_for 10 "static allow element" nft_has '10.99.0.2'
 wait_for 10 "dns-learned dynamic allow" nft_has '1.1.1.1'
 pass "nft static allow + DNS-learned dynamic lease"
 
@@ -486,7 +510,10 @@ else
   # registration.
   set_binding a 10.10.0.5 7 runtime-a-2 att-a-2 '{"defaultAction":"deny"}'
   wait_for 15 "per-subject DNAT" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 tcp dport { 80, 443 } dnat'"
-  nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 ip daddr 10.10.0.1 tcp dport { 80, 443 } return' \
+  # Captured first, not piped: under pipefail `nft list | grep -q` reads as a miss whenever grep
+  # stops at an early match and nft dies of SIGPIPE writing the rest (exit 141).
+  gw_mitm="$(nft list table inet opensandbox_gateway_mitm 2>&1)" || fail "nft list table inet opensandbox_gateway_mitm failed: ${gw_mitm}"
+  grep -q 'ip saddr 10.10.0.5 ip daddr 10.10.0.1 tcp dport { 80, 443 } return' <<<"${gw_mitm}" \
     || fail "management-dst exception missing"
   pass "per-subject DNAT installed (10.10.0.5 -> 10.10.0.1:18081; gateway dst excluded)"
 
@@ -607,7 +634,7 @@ else
   # DoH-443 blocking under MITM: the Pod-netns INPUT enforcement chain
   # applies the blocklist to the DNATed 443 (the forward hook only sees the
   # real destination for non-MITM traffic).
-  nft list table inet opensandbox-fast-sandbox 2>/dev/null | grep -q 'doh_block_v4 tcp dport 443 drop' \
+  nft_has 'doh_block_v4 tcp dport 443 drop' \
     || fail "Pod-layer DoH-443 drop missing under MITM"
   if ip netns exec osb-sandbox-a curl -sk -m 2 -o /dev/null https://203.0.113.1/ 2>/dev/null; then
     fail "blocklisted DoH endpoint 203.0.113.1 must be unreachable under MITM"
@@ -699,9 +726,9 @@ else
   # authority NXDOMAINs the name): drop element + forward/input drop rules.
   wait_for 15 "upstream drop set seeded via the Pod resolver" bash -c \
     "nft list set inet opensandbox-fast-sandbox upstream_proxy_v4 2>/dev/null | grep -q '10.99.0.2'"
-  nft list table inet opensandbox-fast-sandbox 2>/dev/null | grep -q 'upstream_proxy_v4 tcp dport 3128 drop' \
+  nft_has 'upstream_proxy_v4 tcp dport 3128 drop' \
     || fail "profile-wide forward drop rule missing"
-  nft list table inet opensandbox-fast-sandbox 2>/dev/null | grep -q 'ct original ip daddr @upstream_proxy_v4' \
+  nft_has 'ct original ip daddr @upstream_proxy_v4' \
     || fail "input-path containment rule missing (intercepted CONNECTs)"
   pass "drop set seeded from the Pod-resolver authority (split-authority union)"
 
@@ -750,7 +777,7 @@ else
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
   EGRESS_PID=""
-  nft list set inet opensandbox-fast-sandbox upstream_proxy_v4 2>/dev/null | grep -q '10.99.0.2' \
+  nft_has_set upstream_proxy_v4 '10.99.0.2' \
     || fail "drop element must persist in the kernel while the egress daemon is down"
   EGRESS_MITM=1 EGRESS_UPSTREAM_PROXY="http://proxy.test:3128" start_egress
   wait_for 15 "drop set re-seeded after restart" bash -c \
