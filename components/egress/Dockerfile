@@ -108,6 +108,7 @@ RUN apt-get update \
 
 # Python mitmproxy (transparent mode): mitmdump runs as user mitmproxy; iptables skips this uid.
 # /var/lib/mitmproxy is mitm's home, used as the confdir (CA + config.yaml live under .mitmproxy/).
+COPY components/egress/mitmproxy/check-h11.py /tmp/check-h11.py
 RUN useradd -r -u 10042 -d /var/lib/mitmproxy -s /usr/sbin/nologin mitmproxy \
     && mkdir -p /var/lib/mitmproxy/.mitmproxy \
     && chown -R mitmproxy:mitmproxy /var/lib/mitmproxy \
@@ -121,7 +122,13 @@ RUN useradd -r -u 10042 -d /var/lib/mitmproxy -s /usr/sbin/nologin mitmproxy \
     # if either floor is missing or content decoding through mitmproxy stops working: each
     # direction is checked against the other library, since mitmproxy caches its last
     # encode/decode pair and a round-trip through it alone could skip decompress.
-    && pip3 install --no-cache-dir --break-system-packages --no-deps 'Brotli==1.2.1' 'certifi>=2026.10.18' \
+    # h11 the same way: mitmproxy 11.0.2 declares h11<=0.14.0, and h11 0.14.0 carries
+    # CVE-2025-43859 (CRITICAL, fixed in 0.16.0); the mitmproxy releases that allow 0.16 need
+    # Python >=3.12 as well. The readers mitmproxy uses keep their signatures in 0.16.0 (diffed:
+    # only ChunkedReader's footer check changed, which is the fix); check-h11.py drives them
+    # through mitmproxy and fails the build if a body stops reading or the fix is absent.
+    && pip3 install --no-cache-dir --break-system-packages --no-deps 'Brotli==1.2.1' 'certifi>=2026.10.18' 'h11==0.16.0' \
+    && python3 /tmp/check-h11.py && rm -f /tmp/check-h11.py \
     && python3 -c "import importlib.metadata as m; from mitmproxy.net import encoding; \
 assert m.version('brotli') == '1.2.1', m.version('brotli'); \
 assert tuple(map(int, m.version('certifi').split('.'))) >= (2026, 10, 18), m.version('certifi'); \
